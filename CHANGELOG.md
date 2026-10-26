@@ -10,6 +10,7 @@ Progress and analytics.
 - Consistency: adherence per week, streaks, most skipped weekday, consistency since the last comeback after a break.
 - Written insights: strength trends, push/pull balance, low-volume muscle groups.
 - `/analytics`, `/kpd`, `/progress` with an exercise picker, `/body` with a chart; a monthly report on the 1st and a chart with the Sunday summary (`monthly` setting).
+- Clearer `/stats`: one-rep-max estimates are labelled and show the best set and its date, bodyweight exercises have their own section, machines are tagged, tonnage is explained per month and per session, a stale body weight is flagged.
 
 ## 1.0.0 - 2026-10-26
 
