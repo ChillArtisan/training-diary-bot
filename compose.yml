@@ -1,0 +1,21 @@
+services:
+  training_diary_bot:
+    build:
+      context: .
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+    image: training_diary_bot:latest
+    container_name: training_diary_bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DIARY_DB: /app/data/diary.db
+    user: "1000:1000"  # the SQLite files stay owned by the host user, not root
+    volumes:
+      - ./data:/app/data
+      - ./import:/app/import:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
