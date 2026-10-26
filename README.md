@@ -1,6 +1,11 @@
 # training-diary-bot
 
+English | [Русский](README.ru.md)
+
 [![tests](https://github.com/ChillArtisan/training-diary-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/ChillArtisan/training-diary-bot/actions/workflows/ci.yml)
+![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
+![aiogram 3](https://img.shields.io/badge/aiogram-3-2CA5E0?logo=telegram&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A Telegram bot that turns a private gym-diary channel into a training coach.
 
@@ -9,21 +14,23 @@ The bot reads the channel, builds a database out of it, knows where you are in y
 program, and every training morning posts the day's plan **with recommended weights**
 and a one-line reason for each.
 
-```
-НЕДЕЛЯ 2: ПИК · RIR 1
-ЧЕТВЕРГ: НИЗ
-
-Приседания со штангой – 4x5-6 82,5кг
-Румынская тяга – 3x6-8 65кг
-Планка – 3x70с
-
-Разминка (Приседания со штангой): гриф×10 · 32,5×5 · 50×3 · 65×2
-• Приседания со штангой: было 4x8 75кг · новая схема, по силе
-• Румынская тяга: было 3x10 65кг · пометка «не добавлять»
-• Планка: было 65с/60с/60с · цель 70с
-```
+<p align="center">
+  <img src="docs/demo.svg" alt="Output of the CLI today command on the bundled demo export" width="720">
+</p>
+<p align="center"><em>CLI output on the bundled synthetic demo export (<code>python -m diary today --date 2026-10-01</code>). The bot posts the same text to the channel.</em></p>
 
 The bot speaks Russian (it was built for a real Russian-speaking diary); the code, docs and tests are in English.
+
+## Contents
+
+- [What it does](#what-it-does)
+- [How the weights are chosen](#how-the-weights-are-chosen)
+- [Commands](#commands)
+- [Architecture](#architecture)
+- [Project structure](#project-structure)
+- [Quick start](#quick-start)
+- [Try it without Telegram](#try-it-without-telegram)
+- [Development](#development)
 
 ## What it does
 
@@ -79,6 +86,68 @@ a Sunday summary (sessions, tonnage, records, streak, body weight), a gentle not
 - daily SQLite backups (14 kept), a weekly copy sent to the owner, `/export` to CSV;
 - Docker healthcheck on a heartbeat file, errors reported to the owner at most once per 30 minutes, a "was down for N minutes" note after outages; posts written during downtime are still processed.
 
+## How the weights are chosen
+
+All of it lives in `diary/recommend.py` as pure functions; the tunable numbers sit at the top of the file.
+Every recommendation carries a one-line reason, so you can see why a number was picked.
+
+1. **Same scheme as last time** (same rep range, RIR within 0.6) means *double progression* on the last top weight:
+   - every set reached the top of the range: add the smallest step (2.5 kg for barbell, machine and cable; the next dumbbell in the rack; +1 on plate-count machines);
+   - a set below the bottom of the range: hold the weight;
+   - below the bottom twice in a row at the same weight: **−5%**;
+   - anywhere in between: same weight, add reps.
+2. **The scheme or the RIR target changed** (new week, new phase) means an *estimated 1RM with reps in reserve*:
+   `e1RM = w · (1 + (reps + RIR) / 30)` (Epley). The best e1RM of the last 42 days is converted back to the new rep minimum and RIR,
+   then clamped to ×0.90…×1.10 of the last weight.
+   Deload sessions (RIR ≥ 4) are left out of the estimate when other sessions exist, because deload sets are rarely done at the logged RIR.
+   On a deload week itself the lower clamp is ×0.50.
+3. **Your notes win**: «не добавлять» caps the weight, «можно добавить» forces a step up, «потом делай 65кг» sets the target.
+4. **Break penalty** on the final weight when the last session is more than 14 / 30 / 60 days old: ×0.9 / ×0.8 / ×0.7.
+   Timed exercises (planks) get the same factor on the target; otherwise the target is +5 s over the best set.
+5. **Rounding to what exists**: 2.5 kg steps by default; dumbbells go to the nearest weight in the rack
+   (set yours with `/set dumbbell_steps`); machines and cables snap to a stack weight you have used before if it is within 1.5 kg.
+
+An exercise with no history gets "new, pick a weight". `/light` takes 15% off and drops one set; `/short` keeps only the main lifts.
+
+## Commands
+
+All commands go to the bot in a private chat with the owner.
+
+| Command | What it does |
+| :--- | :--- |
+| `/plan` | Today's plan with weights, shown only to you |
+| `/today` | The same plan, posted to the channel |
+| `/light` | Bad-day plan: −15% weight, one set less |
+| `/short` | Short-on-time plan: main lifts only |
+| `/swap` | Alternatives for a taken machine, from exercises you have actually done |
+| `/cycle` | Where you are in the program; `/cycle 6` makes day 6 the next one |
+| `/skip` | Skip the next program day |
+| `/restart` | Start the cycle over from week 1 |
+| `/program` | Switch to another program post |
+| `/pause 7` | Stop reminders for 7 days (or until a date, `/pause 15.11`); logging a workout ends the pause |
+| `/resume` | End the pause |
+| `/avoid жим лёжа` | Replace an exercise in every plan until `/allow` |
+| `/allow` | Bring an avoided exercise back |
+| `/ex жим лёжа` | Last sets of an exercise |
+| `/progress жим лёжа` | Strength chart for an exercise |
+| `/stats` | Overall picture |
+| `/week` | Weekly summary |
+| `/body` | Body weight and measurements |
+| `/plates 82.5` | Plates per side for a target weight |
+| `/warmup 100` | Warm-up ramp to a working weight |
+| `/merge` | Review exercise names the bot thinks are the same |
+| `/alias икры стоя = Подъём на носки стоя` | Teach the bot a name |
+| `/equip жим ногами = тренажёр` | Set an exercise's equipment type |
+| `/forget <link>` | Forget a channel post |
+| `/import` | Import a channel export (`result.json`, `messages.html` or a zip) |
+| `/export` | All sets as CSV |
+| `/backup` | Send a copy of the database |
+| `/settings`, `/set key value` | Reminder times, toggles, bar weight, dumbbell rack |
+| `/status` | Bot state |
+| `/start`, `/help` | Pairing and the command list |
+
+You can also send a workout to the bot directly; it posts it to the channel.
+
 ## Architecture
 
 ```mermaid
@@ -99,6 +168,37 @@ flowchart LR
 ```
 
 `diary/` has no Telegram dependency: everything is testable and usable from the CLI.
+More detail, the data model and the self-healing mechanisms: [docs/architecture.md](docs/architecture.md).
+
+## Project structure
+
+```
+diary/                  pure logic, no Telegram
+  parse.py              free-text line grammar, PARSER_VERSION
+  aliases.py            exercise names: normalization, synonyms, equipment guess, fuzzy match
+  ingest.py             posts -> database; imports; re-parse after parser updates
+  program.py            position in the program cycle: next day, skip, restart
+  recommend.py          weight recommendation (pure functions, all constants)
+  today.py              builds and renders the day's plan
+  stats.py              records, progress, weekly summary
+  movement.py           exercise alternatives for /swap and /avoid
+  plates.py             plates per side, warm-up ramp
+  backup.py             SQLite backups, CSV export
+  state.py              pause and avoid-list state
+  db.py, schema.sql     SQLite access, schema, MIGRATIONS
+  __main__.py           CLI: import | today | cycle | suggestions
+bot/                    aiogram 3 layer
+  __main__.py           startup, polling, downtime notice, command menu
+  channel.py            channel posts and edits
+  owner.py              owner commands and buttons, pairing
+  scheduler.py          timed jobs, heartbeat
+  common.py             identity, error alerts, helpers
+  prefs.py              owner-editable settings
+  config.py             environment configuration
+tests/                  pytest suite
+examples/               synthetic demo export and its generator
+docs/                   architecture notes, demo.svg
+```
 
 ## Quick start
 
@@ -120,7 +220,7 @@ docker compose build && docker compose up -d
 pip install -r requirements.txt -c constraints.txt
 python examples/make_demo_export.py
 python -m diary --db demo.db import examples/demo_export
-python -m diary --db demo.db today
+python -m diary --db demo.db today --date 2026-10-01
 python -m diary --db demo.db cycle
 ```
 
