@@ -66,7 +66,7 @@ def strength(name: str, points: list[tuple[date, float, float | None]]) -> bytes
             if best:
                 prs.append((d, e))
             best = e
-    ax.plot(days, e1, color=ACCENT, linewidth=2, marker="o", markersize=3.5, label="сила (оценка 1ПМ)")
+    ax.plot(days, e1, color=ACCENT, linewidth=2, marker="o", markersize=3.5, label="максимум на 1 повтор (оценка)")
     tops = [(d, w) for d, _, w in points if w]
     if tops:
         ax.plot([d for d, _ in tops], [w for _, w in tops], color=MUTED, linewidth=1, linestyle="--", label="рабочий вес")

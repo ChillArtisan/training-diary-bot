@@ -1,6 +1,7 @@
 """Records, progress and summaries. Read-only over the database."""
 from __future__ import annotations
 
+import html
 from dataclasses import dataclass
 from datetime import date, timedelta
 
@@ -34,7 +35,7 @@ class Record:
 
     def text(self) -> str:
         return (f"{self.exercise}: {fmt_weight(self.weight, self.kind)}×{self.reps} → "
-                f"силовой {fmt_num(round(self.e1rm, 1))} (было {fmt_num(round(self.previous, 1))})")
+                f"максимум на 1 повтор ≈{fmt_num(round(self.e1rm))} кг (было ≈{fmt_num(round(self.previous))})")
 
 
 def _best(rows, bw) -> tuple[float, object] | None:
@@ -102,8 +103,8 @@ def progress_text(db: Db, eid: int) -> str:
     lines = [
         f"{name}",
         f"{sparkline([v for _, v in months])}  {months[0][0]} → {months[-1][0]}",
-        f"силовой (1ПМ по Эпли): сейчас {fmt_num(round(last, 1))}, лучший {fmt_num(round(top, 1))} "
-        f"({date.fromisoformat(top_day):%d.%m.%y}), с начала {'+' if last >= first else ''}{fmt_num(round(last - first, 1))}",
+        f"Максимум на 1 повтор (оценка, кг): сейчас ≈{fmt_num(round(last))}, лучший ≈{fmt_num(round(top))} "
+        f"({date.fromisoformat(top_day):%d.%m.%y}), с начала {'+' if last >= first else ''}{fmt_num(round(last - first, 1))} кг",
     ]
     return "\n".join(lines)
 
@@ -157,7 +158,7 @@ def records_between(db: Db, first: date, last: date) -> list[str]:
             out[r["exercise"]] = max(out.get(r["exercise"], 0), e)
         if prev is None or e > prev:
             best[r["exercise_id"]] = e
-    return [f"{name} — силовой {fmt_num(round(e, 1))}" for name, e in out.items()]
+    return [f"{name} — ≈{fmt_num(round(e))} кг на 1 повтор" for name, e in out.items()]
 
 
 def body_change(db: Db, first: date, last: date) -> str | None:
@@ -198,28 +199,74 @@ def weekly_summary(db: Db, today: date) -> str:
     return "\n".join(lines)
 
 
+MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",
+          "ноябрь", "декабрь"]
+EQUIPMENT_TAG = {"machine": "тренажёр", "cable": "блок", "dumbbell": "одна гантель"}
+STALE_BODYWEIGHT_DAYS = 30
+
+
+def _month_line(db: Db, first: date, last: date) -> str:
+    t = tonnage(db.sets_between(first.isoformat(), last.isoformat()))
+    n = training_days(db, first, last)
+    per = f" (≈{fmt_num(round(t / n / 1000, 1))} т за тренировку)" if n else ""
+    return f"• {MONTHS[first.month - 1]}: {fmt_num(round(t / 1000, 1))} т за {n} трен.{per}"
+
+
+def best_sets(db: Db, min_sessions: int = 3) -> list[tuple[float, str, object]]:
+    """Per exercise: the set with the highest estimated one-rep max -> (estimate, name, set row)."""
+    bw = db.bodyweight()
+    out = []
+    for x in db.exercises_used():
+        if x["sessions"] < min_sessions:
+            continue
+        best = _best(db.exercise_sets(x["id"]), bw)
+        if best:
+            out.append((best[0], x["name"], best[1]))
+    return sorted(out, key=lambda b: -b[0])
+
+
 def overall(db: Db, today: date) -> str:
     c = db.counts()
     first = db.one("SELECT MIN(day) d FROM session")["d"]
+    if not first:
+        return "Тренировок пока нет."
+    planned = planned_per_week(db)
+    recent = training_days(db, today - timedelta(days=27), today)
     month_start = today.replace(day=1)
-    prev_month_end = month_start - timedelta(days=1)
-    t_month = tonnage(db.sets_between(month_start.isoformat(), today.isoformat()))
-    t_prev = tonnage(db.sets_between(prev_month_end.replace(day=1).isoformat(), prev_month_end.isoformat()))
+    prev_end = month_start - timedelta(days=1)
     lines = [
-        f"Тренировок: {c['sessions']} с {date.fromisoformat(first):%d.%m.%y}" if first else "Тренировок пока нет",
-        f"Тоннаж за месяц: {fmt_num(round(t_month / 1000, 1))} т (прошлый — {fmt_num(round(t_prev / 1000, 1))} т)",
-        f"Серия: {streak(db, today)} нед.",
+        "<b>Общая картина</b>",
+        f"Тренировок: {c['sessions']} с {date.fromisoformat(first):%d.%m.%y}, за последние 4 недели — {recent}",
+        f"Серия: {streak(db, today)} нед. подряд (неделя засчитывается от {max(1, planned - 1)} трен. из {planned})",
+        "",
+        "<b>Тоннаж</b> — сумма «вес × повторы» по всем подходам со штангой, гантелями и в тренажёрах:",
+        _month_line(db, month_start, today),
+        _month_line(db, prev_end.replace(day=1), prev_end),
     ]
-    tops = []
-    for x in db.exercises_used():
-        series = e1rm_series(db, x["id"])
-        if len(series) >= 3:
-            tops.append((max(e for _, e in series), x["name"]))
-    if tops:
-        lines.append("Сильнейшие движения:")
-        lines += [f"• {name} — {fmt_num(round(e, 1))}" for e, name in sorted(tops, reverse=True)[:5]]
-    if bw := db.bodyweight():
-        lines.append(f"Вес тела: {fmt_num(bw)} кг")
+    tops = best_sets(db)
+    free = [b for b in tops if b[2]["weight_kind"] != "added"][:6]
+    loaded = [b for b in tops if b[2]["weight_kind"] == "added"][:3]
+    if free:
+        lines += ["", "<b>Максимум на 1 повтор</b> — оценка в кг по лучшему подходу (формула Эпли):"]
+        for e, name, r in free:
+            tag = EQUIPMENT_TAG.get(db.exercise(r["exercise_id"])["equipment"])
+            lines.append(f"• {html.escape(name)}{f' ({tag})' if tag else ''} — ≈{fmt_num(round(e))} кг: "
+                         f"{fmt_weight(r['weight'], r['weight_kind'])}×{r['reps']}, {date.fromisoformat(r['day']):%d.%m.%y}")
+        if any(EQUIPMENT_TAG.get(db.exercise(b[2]["exercise_id"])["equipment"]) for b in free):
+            lines.append("<i>Тренажёры и блоки со штангой не сравнивай: у них своя механика и свои цифры.</i>")
+    bw = db.bodyweight()
+    if loaded and bw:
+        lines += ["", f"<b>Со своим весом</b> — свой вес {fmt_num(bw)} кг плюс отягощение, оценка на 1 повтор:"]
+        for e, name, r in loaded:
+            lines.append(f"• {html.escape(name)} — ≈{fmt_num(round(e))} кг: {fmt_weight(r['weight'], 'added')}×{r['reps']}, "
+                         f"{date.fromisoformat(r['day']):%d.%m.%y}")
+    body = db.one("SELECT day, weight FROM body ORDER BY day DESC LIMIT 1")
+    if body:
+        day = date.fromisoformat(body["day"])
+        line = f"Вес тела: {fmt_num(body['weight'])} кг на {day:%d.%m.%y}"
+        if (today - day).days > STALE_BODYWEIGHT_DAYS:
+            line += f" — это {(today - day).days} дн. назад; напиши в канал свежий, например «70,6кг»"
+        lines += ["", line]
     return "\n".join(lines)
 
 

@@ -303,7 +303,7 @@ def build_owner_router(db: Db, ident: Identity) -> Router:
 
     @router.message(Command("stats"))
     async def on_stats(message: Message) -> None:
-        await send_long(message.bot, message.chat.id, html.escape(stats.overall(db, today())))
+        await send_long(message.bot, message.chat.id, stats.overall(db, today()))  # already HTML, names escaped
 
     @router.message(Command("week"))
     async def on_week(message: Message) -> None:

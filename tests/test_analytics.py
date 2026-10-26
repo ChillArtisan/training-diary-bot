@@ -122,3 +122,16 @@ def test_progress_menu(db):
     data = [b.callback_data for row in menu.inline_keyboard for b in row]
     assert "chart:body" in data and "chart:kpd" in data and any(d.split(":")[1].isdigit() for d in data)
     assert ui.BTN_ANALYTICS in {b.text for row in ui.MAIN.keyboard for b in row}
+
+
+def test_overall_is_labelled(db):
+    from diary import stats
+    for i, day in enumerate([4, 11, 18]):
+        week1(db, 2 + i, day, bench=60 + 2.5 * i)
+        ingest_post(db, 20 + i, at(day + 1), f"Подтягивания с весом – 4x8 +{5 + i}кг")
+    ingest_post(db, 30, at(2), "70,6кг")
+    text = stats.overall(db, date(2026, 12, 1))
+    assert "Максимум на 1 повтор" in text and "≈" in text and "65кг×8" in text
+    assert "Со своим весом" in text and "Подтягивания с весом" in text.split("Со своим весом")[1]
+    assert "на 03.10.26" in text and "дн. назад" in text
+    assert "Тоннаж</b> — сумма «вес × повторы»" in text
