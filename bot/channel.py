@@ -8,9 +8,11 @@ from aiogram import Bot, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import ChatMemberUpdated, Message, ReactionTypeEmoji
 
+from diary import analytics
 from diary.db import Db
 from diary.ingest import IngestResult, ingest_post
 
+from . import prefs
 from .common import Identity, dm, kb, send_suggestion
 
 log = logging.getLogger(__name__)
@@ -36,8 +38,14 @@ async def report(bot: Bot, db: Db, ident: Identity, res: IngestResult, live: boo
         lines = "\n".join(f"• {html.escape(u)}" for u in res.unparsed)
         await dm(bot, ident, f'Не разобрал строки в <a href="{link}">посте</a>:\n{lines}\n'
                              f"Поправь пост — я перечитаю его сам.")
-    if live and res.records:
-        await dm(bot, ident, "🔥 Рекорд!\n" + "\n".join(html.escape(r.text()) for r in res.records))
+    if live and res.kind == "log" and res.sets:
+        lines = []
+        if prefs.on(db, "log_feedback") and (k := analytics.post_kpd(db, res.message_id)) and k.score is not None:
+            lines.append(f"Записал{' «' + html.escape(k.title) + '»' if k.title else ''}. {html.escape(k.text())}")
+        if res.records:
+            lines.append("🔥 Рекорд!\n" + "\n".join(html.escape(r.text()) for r in res.records))
+        if lines:
+            await dm(bot, ident, "\n\n".join(lines))
     if res.resumed:
         await dm(bot, ident, "С возвращением! Пауза снята, напоминания снова включены.")
     if res.suggestions and ident.owner_id:  # one question at a time; each answer brings the next

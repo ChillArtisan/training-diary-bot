@@ -5,6 +5,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 TZ=Europe/Moscow APP_VERSION=$A
 WORKDIR /app
 COPY requirements.txt constraints.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
+# build matplotlib's font cache once, writable for the non-root runtime user
+ENV MPLCONFIGDIR=/opt/mpl
+RUN mkdir -p /opt/mpl && python -c "import matplotlib.font_manager" && chmod -R a+rwX /opt/mpl
 COPY diary ./diary
 COPY bot ./bot
 

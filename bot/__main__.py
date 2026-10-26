@@ -12,6 +12,7 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, ErrorEvent
 from diary.db import Db
 from diary.ingest import reparse_if_needed
 
+from . import ui
 from .channel import build_channel_router
 from .common import Alerts, Identity, dm, now_msk
 from .config import Config
@@ -25,7 +26,8 @@ COMMANDS = [
     ("plan", "программа на сегодня"), ("today", "программа в канал"), ("light", "плохой день: легче"),
     ("short", "мало времени"), ("swap", "чем заменить упражнение"), ("cycle", "где я в цикле"),
     ("skip", "пропустить день"), ("pause", "болею / уехал"), ("resume", "снять паузу"),
-    ("avoid", "болит: убрать упражнение"), ("progress", "график силы"), ("stats", "общая картина"),
+    ("avoid", "болит: убрать упражнение"), ("analytics", "аналитика с графиками"), ("progress", "график силы"),
+    ("kpd", "КПД тренировок"), ("body", "вес и замеры"), ("stats", "общая картина"),
     ("week", "итоги недели"), ("plates", "блины на сторону"), ("help", "все команды"),
 ]
 
@@ -36,6 +38,10 @@ async def startup(bot: Bot, db: Db, ident: Identity) -> None:
         log.info("re-parsed %d posts after a parser update", n)
     await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in COMMANDS],
                               scope=BotCommandScopeAllPrivateChats())
+    if ident.owner_id and db.get("keyboard_version") != ui.KEYBOARD_VERSION:
+        if await dm(bot, ident, "Обновление: кнопки снизу, 📊 Аналитика с графиками, 📈 Прогресс по упражнениям "
+                                "и КПД после каждой тренировки.", reply_markup=ui.MAIN):
+            db.set("keyboard_version", ui.KEYBOARD_VERSION)
     last_beat = (db.path.parent / "heartbeat")
     if last_beat.exists():
         down = (now_msk() - datetime.fromisoformat(last_beat.read_text())).total_seconds() / 60

@@ -18,6 +18,8 @@ PREFS: dict[str, tuple[str, str, str]] = {
     "nudge_time": ("21:30", TIME, "время вечернего вопроса"),
     "summary": ("on", ON_OFF, "итоги недели в воскресенье"),
     "summary_time": ("20:00", TIME, "время итогов недели"),
+    "monthly": ("on", ON_OFF, "1-го числа отчёт за месяц с графиками"),
+    "log_feedback": ("on", ON_OFF, "после записи тренировки присылать её КПД"),
     "backup_send": ("on", ON_OFF, "раз в неделю присылать копию базы"),
     "bodyweight": ("", NUMBER, "вес тела, если нет постов вида «70,6кг»"),
     "bar_weight": ("20", NUMBER, "вес грифа"),

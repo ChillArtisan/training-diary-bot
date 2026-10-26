@@ -1,11 +1,11 @@
 [project]
 name = "training-diary-bot"
-version = "1.0.0"
+version = "1.1.0"
 description = "Telegram bot that turns a free-text gym diary channel into a training coach"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"
-dependencies = ["aiogram>=3.26", "aiohttp-socks>=0.10"]
+dependencies = ["aiogram>=3.26", "aiohttp-socks>=0.10", "matplotlib>=3.9"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

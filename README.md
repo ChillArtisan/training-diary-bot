@@ -79,6 +79,19 @@ Workouts split over two posts, posted a day late, or written without headers are
 a Sunday summary (sessions, tonnage, records, streak, body weight), a gentle note after a week of silence,
 🔥 reactions on personal records.
 
+**Shows progress.** A persistent keyboard in the private chat (📋 План · 😵 Лёгкий · ⏱ Коротко · 🔁 Замена ·
+📈 Прогресс · 📊 Аналитика · ⏸ Пауза) and charts rendered with matplotlib:
+
+- *strength* per exercise: estimated 1RM per session, working weight, record markers;
+- *consistency*: a GitHub-style calendar, adherence to the planned days per week, current and best streak,
+  the weekday you skip most, and consistency since the last comeback after a break;
+- *session efficiency (KPD)*: plan completion (40%) + sets that reached the bottom of the rep range (40%) +
+  progress against the same program day of the previous cycle (20%); deload weeks are not penalized for no progress.
+  Sent after every logged workout;
+- *weekly volume per muscle group* against the common 10–20 sets guideline, push/pull balance;
+- body weight with a 7-day average and measurement changes;
+- a monthly report on the 1st and a chart with the Sunday summary.
+
 **Runs without a maintainer.**
 
 - zero-config pairing: only `BOT_TOKEN` is required — forward any channel post to the bot and Telegram itself confirms you are an admin there;
@@ -129,10 +142,12 @@ All commands go to the bot in a private chat with the owner.
 | `/avoid жим лёжа` | Replace an exercise in every plan until `/allow` |
 | `/allow` | Bring an avoided exercise back |
 | `/ex жим лёжа` | Last sets of an exercise |
-| `/progress жим лёжа` | Strength chart for an exercise |
+| `/analytics` | Consistency calendar, weekly chart, volume per muscle group and written insights |
+| `/progress` | Strength chart: pick an exercise with buttons or `/progress жим лёжа` |
+| `/kpd` | Efficiency of recent sessions with a chart |
 | `/stats` | Overall picture |
 | `/week` | Weekly summary |
-| `/body` | Body weight and measurements |
+| `/body` | Body weight chart and measurements |
 | `/plates 82.5` | Plates per side for a target weight |
 | `/warmup 100` | Warm-up ramp to a working weight |
 | `/merge` | Review exercise names the bot thinks are the same |
@@ -181,6 +196,8 @@ diary/                  pure logic, no Telegram
   recommend.py          weight recommendation (pure functions, all constants)
   today.py              builds and renders the day's plan
   stats.py              records, progress, weekly summary
+  analytics.py          session KPD, consistency, volume per muscle group, insights
+  charts.py             PNG charts (matplotlib object API, safe in a worker thread)
   movement.py           exercise alternatives for /swap and /avoid
   plates.py             plates per side, warm-up ramp
   backup.py             SQLite backups, CSV export
@@ -191,6 +208,7 @@ bot/                    aiogram 3 layer
   __main__.py           startup, polling, downtime notice, command menu
   channel.py            channel posts and edits
   owner.py              owner commands and buttons, pairing
+  ui.py                 persistent keyboard, chart delivery
   scheduler.py          timed jobs, heartbeat
   common.py             identity, error alerts, helpers
   prefs.py              owner-editable settings

@@ -83,3 +83,12 @@ One failing job does not stop the others.
 **Zero-config pairing.** Only `BOT_TOKEN` is required. Until an owner is known, the bot accepts a forwarded channel post in a private chat.
 The forward names the channel; the bot asks Telegram whether it and the sender are administrators there, and only then stores
 the channel and the owner. `OWNER_ID` and `CHANNEL_ID` can still be set in the environment.
+
+## Analytics
+
+`diary/analytics.py` computes plain data from the same tables: session KPD (plan completion 40%, sets reaching the
+bottom of the rep range 40%, progress against the same program day of the previous cycle 20%, deload sessions not
+judged on progress), weekly consistency with streaks and the comeback after a break, sets per muscle group, strength
+trends and written insights. `diary/charts.py` turns that data into PNGs with matplotlib's object API; `bot/ui.py`
+prepares the data on the event loop and renders in `asyncio.to_thread`, so the shared SQLite connection is never used
+from the worker thread.

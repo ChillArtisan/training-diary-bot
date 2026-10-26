@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -11,16 +12,18 @@ from typing import Awaitable, Callable
 from aiogram import Bot
 from aiogram.types import FSInputFile
 
-from diary import backup, program, state, stats
+from diary import analytics, backup, charts, program, state, stats
 from diary.db import Db
 from diary.today import RESTART_AFTER_DAYS, gap_days
 
-from . import prefs
+from . import prefs, ui
 from .common import Alerts, Identity, dm, kb, now_msk, post_plan
 
 log = logging.getLogger(__name__)
 TICK = 30
 INACTIVE_DAYS = 7
+MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",
+          "ноябрь", "декабрь"]
 
 
 @dataclass
@@ -70,7 +73,23 @@ async def run_nudge(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
 
 
 async def run_summary(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
-    await dm(bot, ident, stats.weekly_summary(db, now.date()))
+    text = stats.weekly_summary(db, now.date())
+    c = analytics.consistency(db, now.date())
+    png = await ui.render(charts.weekly, analytics.weekly_series(db, now.date()), c.planned)
+    if png and ident.owner_id and len(text) <= 1000:
+        await bot.send_photo(ident.owner_id, ui.photo(png, "week"), caption=html.escape(text))
+    else:
+        await dm(bot, ident, html.escape(text))
+
+
+async def run_monthly(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
+    if ident.owner_id:
+        prev = (now.date().replace(day=1) - timedelta(days=1))
+        await ui.send_analytics(bot, ident.owner_id, db, now.date(), title=f"📊 Итоги: {MONTHS[prev.month - 1]}")
+
+
+def monthly(d: date) -> str:
+    return f"{d.year}-{d.month:02d}"
 
 
 async def run_inactivity(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
@@ -105,6 +124,8 @@ JOBS = [
         and not db.has_session_on(now.date().isoformat()), run_nudge),
     Job("summary", lambda db: prefs.hhmm(db, "summary_time"), timedelta(hours=3), weekly,
         lambda db, now: prefs.on(db, "summary") and now.weekday() == 6, run_summary),
+    Job("monthly", lambda db: prefs.hhmm(db, "summary_time"), timedelta(hours=3), monthly,
+        lambda db, now: prefs.on(db, "monthly") and now.day == 1 and db.last_session_day() is not None, run_monthly),
     Job("inactivity", lambda db: (12, 0), timedelta(hours=10), daily,
         lambda db, now: not state.is_paused(db, now.date()) and inactive(db, now), run_inactivity),
     Job("backup", lambda db: (4, 0), timedelta(hours=20), daily, lambda db, now: True, run_backup),

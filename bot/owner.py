@@ -22,7 +22,7 @@ from diary.parse import parse_post
 from diary.recommend import fmt_num
 from diary.today import build_plan, last_sessions_text, render_html, swap_text
 
-from . import prefs
+from . import prefs, ui
 from .channel import reaction_for, report
 from .common import Identity, find_exercise, kb, now_msk, post_plan, send_long, send_suggestion
 
@@ -47,9 +47,11 @@ HELP = """<b>Каждый день</b>
 /pause 7 — болею или уехал (или /pause 15.11) · /resume
 /avoid жим лёжа — болит, убрать из плана · /allow — вернуть
 
-<b>Прогресс</b>
-/ex жим лёжа — последние подходы · /progress жим лёжа — график силы
-/stats — общая картина · /week — итоги недели · /body — замеры
+<b>Прогресс и аналитика</b>
+/analytics — постоянство, недели, объём по мышцам, выводы
+/progress — график силы (кнопками или /progress жим лёжа)
+/kpd — КПД тренировок · /body — вес и замеры
+/ex жим лёжа — последние подходы · /stats — общая картина · /week — итоги недели
 
 <b>Зал</b>
 /plates 82.5 — блины на сторону · /warmup 100 — разминка
@@ -60,7 +62,7 @@ HELP = """<b>Каждый день</b>
 /import — пришли файл экспорта · /export — CSV · /backup — копия базы
 /settings · /set ключ значение · /status
 
-Тренировку можно прислать и сюда — я выложу её в канал."""
+Тренировку можно прислать и сюда — я выложу её в канал. Главное — на кнопках снизу."""
 
 
 def parse_until(arg: str, today: date) -> date | None | str:
@@ -108,7 +110,48 @@ def build_owner_router(db: Db, ident: Identity) -> Router:
 
     @router.message(Command("start", "help"))
     async def on_help(message: Message) -> None:
-        await message.answer(HELP)
+        await message.answer(HELP, reply_markup=ui.MAIN)
+
+    # ---------- keyboard ----------
+
+    @router.message(F.text == ui.BTN_PLAN)
+    async def kb_plan(message: Message) -> None:
+        await show_plan(message, "normal")
+
+    @router.message(F.text == ui.BTN_LIGHT)
+    async def kb_light(message: Message) -> None:
+        await show_plan(message, "light")
+
+    @router.message(F.text == ui.BTN_SHORT)
+    async def kb_short(message: Message) -> None:
+        await show_plan(message, "short")
+
+    @router.message(F.text == ui.BTN_SWAP)
+    async def kb_swap(message: Message, bot: Bot) -> None:
+        await swap_menu(message.chat.id, bot)
+
+    @router.message(F.text == ui.BTN_PROGRESS)
+    async def kb_progress(message: Message) -> None:
+        await message.answer("График чего показать?", reply_markup=ui.progress_menu(db, today()))
+
+    @router.message(F.text == ui.BTN_ANALYTICS)
+    async def kb_analytics(message: Message, bot: Bot) -> None:
+        await ui.send_analytics(bot, message.chat.id, db, today())
+
+    @router.message(F.text == ui.BTN_PAUSE)
+    async def kb_pause(message: Message) -> None:
+        if state.is_paused(db, today()):
+            until = state.paused_until(db)
+            when = "до /resume" if until and until.year == 9999 else f"до {until:%d.%m}"
+            await message.answer(f"Сейчас пауза {when}.", reply_markup=kb([("▶️ Снять паузу", "resume")]))
+            return
+        await message.answer("Болеешь или уехал? Напоминания замолчат, запись тренировки снимет паузу сама.",
+                             reply_markup=kb([("3 дня", "pause:3"), ("Неделя", "pause:7"), ("2 недели", "pause:14")],
+                                             [("Пока не сниму", "pause:0")]))
+
+    @router.message(F.text == ui.BTN_MORE)
+    async def kb_more(message: Message) -> None:
+        await message.answer(HELP, reply_markup=ui.MAIN)
 
     async def show_plan(message: Message, mode: str) -> None:
         plan = build_plan(db, today(), mode=mode)
@@ -243,9 +286,20 @@ def build_owner_router(db: Db, ident: Identity) -> Router:
                                  + html.escape(last_sessions_text(db, eid)))
 
     @router.message(Command("progress"))
-    async def on_progress(message: Message, command: CommandObject) -> None:
+    async def on_progress(message: Message, command: CommandObject, bot: Bot) -> None:
+        if not command.args:
+            await message.answer("График чего показать?", reply_markup=ui.progress_menu(db, today()))
+            return
         if eid := await need_exercise(message, command.args, "/progress присед"):
-            await message.answer(html.escape(stats.progress_text(db, eid)))
+            await ui.send_strength(bot, message.chat.id, db, eid)
+
+    @router.message(Command("analytics"))
+    async def on_analytics(message: Message, bot: Bot) -> None:
+        await ui.send_analytics(bot, message.chat.id, db, today())
+
+    @router.message(Command("kpd"))
+    async def on_kpd(message: Message, bot: Bot) -> None:
+        await ui.send_kpd(bot, message.chat.id, db)
 
     @router.message(Command("stats"))
     async def on_stats(message: Message) -> None:
@@ -256,8 +310,8 @@ def build_owner_router(db: Db, ident: Identity) -> Router:
         await message.answer(html.escape(stats.weekly_summary(db, today())))
 
     @router.message(Command("body"))
-    async def on_body(message: Message) -> None:
-        await message.answer(html.escape(stats.measurements_text(db)))
+    async def on_body(message: Message, bot: Bot) -> None:
+        await ui.send_body(bot, message.chat.id, db)
 
     # ---------- gym ----------
 
@@ -484,6 +538,37 @@ def build_owner_router(db: Db, ident: Identity) -> Router:
         await cb.answer()
         await report(bot, db, ident, res)
 
+    @router.callback_query(F.data == "progressmenu")
+    async def cb_progressmenu(cb: CallbackQuery) -> None:
+        await cb.answer()
+        await cb.message.answer("График чего показать?", reply_markup=ui.progress_menu(db, today()))
+
+    @router.callback_query(F.data.startswith("chart:"))
+    async def cb_chart(cb: CallbackQuery, bot: Bot) -> None:
+        await cb.answer("Рисую…")
+        what = cb.data.split(":")[1]
+        if what == "body":
+            await ui.send_body(bot, cb.message.chat.id, db)
+        elif what == "kpd":
+            await ui.send_kpd(bot, cb.message.chat.id, db)
+        elif db.exercise(int(what)):
+            await ui.send_strength(bot, cb.message.chat.id, db, int(what))
+
+    @router.callback_query(F.data.startswith("pause:"))
+    async def cb_pause(cb: CallbackQuery) -> None:
+        days = int(cb.data.split(":")[1])
+        until = today() + timedelta(days=days) if days else None
+        state.pause(db, today(), until)
+        await cb.message.edit_text(f"Пауза {'до ' + format(until, '%d.%m') if until else 'до /resume'}. "
+                                   "Напоминания молчат; запишешь тренировку — пауза снимется сама.")
+        await cb.answer()
+
+    @router.callback_query(F.data == "resume")
+    async def cb_resume(cb: CallbackQuery) -> None:
+        state.resume(db)
+        await cb.message.edit_text("Пауза снята. Программа — 📋 План.")
+        await cb.answer()
+
     @router.callback_query(F.data.startswith("plan:"))
     async def cb_plan(cb: CallbackQuery) -> None:
         await cb.answer()
@@ -576,7 +661,7 @@ def build_claim_router(db: Db, ident: Identity) -> Router:
             await message.answer("Это личный бот дневника. Владелец — админ канала.")
             return
         ident.set_owner(message.from_user.id)
-        await message.answer("Готово, ты владелец.\n\n" + HELP)
+        await message.answer("Готово, ты владелец.\n\n" + HELP, reply_markup=ui.MAIN)
 
     @router.message(F.forward_origin.as_("origin"))
     async def on_forward(message: Message, origin, bot: Bot) -> None:
@@ -597,6 +682,7 @@ def build_claim_router(db: Db, ident: Identity) -> Router:
         ident.set_channel(chat_id)
         ident.set_owner(message.from_user.id)
         await message.answer(f"Готово: канал «{html.escape(origin.chat.title or '')}», ты владелец.\n"
-                             "Старые посты подтяну, если пришлёшь экспорт канала (/import).\n\n" + HELP)
+                             "Старые посты подтяну, если пришлёшь экспорт канала (/import).\n\n" + HELP,
+                             reply_markup=ui.MAIN)
 
     return router

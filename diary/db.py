@@ -266,6 +266,18 @@ class Db:
                JOIN exercise x ON x.id = e.exercise_id ORDER BY p.date_utc, s.id, e.line_no, e.set_idx"""
         )
 
+    def sessions_chrono(self) -> list[sqlite3.Row]:
+        return self.q(
+            """SELECT s.*, p.date_utc FROM session s JOIN post p ON p.message_id = s.post_id
+               ORDER BY p.date_utc, s.id"""
+        )
+
+    def all_program_items(self) -> list[sqlite3.Row]:
+        return self.q(
+            """SELECT d.program_id, d.ord AS day_ord, d.rir AS day_rir, d.phase, i.*
+               FROM program_item i JOIN program_day d ON d.id = i.day_id"""
+        )
+
     def exercises_used(self) -> list[sqlite3.Row]:
         return self.q(
             """SELECT x.id, x.name, x.equipment, MAX(s.day) AS last_day, COUNT(DISTINCT s.id) AS sessions

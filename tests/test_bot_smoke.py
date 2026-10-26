@@ -16,6 +16,7 @@ class FakeBot:
     def __init__(self):
         self.sent: list[tuple[int, str]] = []
         self.docs: list[int] = []
+        self.photos: list[tuple[int, str]] = []
         self._ids = itertools.count(1000)
 
     async def send_message(self, chat_id, text, **kw):
@@ -24,6 +25,14 @@ class FakeBot:
 
     async def send_document(self, chat_id, document, **kw):
         self.docs.append(chat_id)
+
+    async def send_photo(self, chat_id, photo, caption=None, **kw):
+        self.photos.append((chat_id, caption or ""))
+        return SimpleNamespace(message_id=next(self._ids))
+
+    async def send_media_group(self, chat_id, media, **kw):
+        self.photos += [(chat_id, "") for _ in media]
+        return []
 
 
 @pytest.fixture
@@ -100,9 +109,11 @@ def test_evening_nudge_and_weekly_summary(env):
     tuesday_evening = datetime(2026, 10, 27, 21, 40, tzinfo=MSK)
     assert "nudge" in run(tick(bot, db, ident, alerts, tuesday_evening))
     assert bot.sent[-1][0] == 7
+    ingest_post(db, 2, datetime(2026, 10, 26, 9, 0, tzinfo=timezone.utc), "Жим штанги лежа – 4x8 60кг")
     sunday = datetime(2026, 11, 1, 20, 10, tzinfo=MSK)
-    assert "summary" in run(tick(bot, db, ident, alerts, sunday))
-    assert "Тренировок" in bot.sent[-1][1]
+    ran = run(tick(bot, db, ident, alerts, sunday))
+    assert "summary" in ran and "monthly" in ran  # 1 November is a Sunday
+    assert any("Тренировок" in caption for _, caption in bot.photos)  # the weekly chart carries the summary
 
 
 def test_inactivity_once_per_gap(env):
