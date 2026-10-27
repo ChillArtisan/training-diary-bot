@@ -8,13 +8,13 @@ from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
-from . import aliases, program, state, stats
+from . import aliases, clock, program, state, stats
 from .db import Db
 from .parse import PARSER_VERSION, DateHint, ParsedPost, parse_post
 
 MAX_BACKDATE_DAYS = 14
 
-MSK = timezone(timedelta(hours=3))  # Moscow has no DST since 2014
+MSK = clock.TZ  # kept for old imports; use diary.clock
 
 
 @dataclass
@@ -41,7 +41,7 @@ class IngestResult:
 def local_day(when: datetime) -> str:
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
-    return when.astimezone(MSK).date().isoformat()
+    return clock.local_day(when).isoformat()
 
 
 def resolve_day(post_day: str, hint: DateHint | None) -> str:
@@ -61,13 +61,19 @@ def resolve_day(post_day: str, hint: DateHint | None) -> str:
 
 
 def resolve(db: Db, raw_name: str, known: dict[str, int] | None = None) -> Resolved:
-    """Exact alias -> fuzzy (same first word, >= AUTO) -> new exercise (+ suggestion if close)."""
+    """Exact alias -> fuzzy (a typo, >= AUTO) -> new exercise (+ suggestion if close)."""
     n = aliases.norm(raw_name)
     if eid := db.exercise_by_alias(n):
-        return Resolved(eid)
+        ex = db.exercise(eid)
+        if not (ex and aliases.conflicting(raw_name, ex["name"])):
+            return Resolved(eid)
+        n = aliases.norm_full(raw_name)  # «брусья (акцент на трицепс)» is not «брусья (акцент на грудь)»
+        if eid := db.exercise_by_alias(n):
+            return Resolved(eid)
     known = known if known is not None else db.alias_map()
     best_id, sc, best_alias = aliases.best_match(n, known)
-    if best_id and sc >= aliases.AUTO_SCORE and aliases.same_first_word(n, best_alias):
+    if best_id and sc >= aliases.AUTO_SCORE and aliases.safe_auto(n, best_alias) \
+            and not aliases.equipment_clash(n, best_alias):
         db.add_alias(n, best_id)
         known[n] = best_id
         return Resolved(best_id)
@@ -99,22 +105,25 @@ def ingest_post(db: Db, message_id: int, when: datetime, text: str, edited: date
         return r.exercise_id
 
     with db.tx():
+        old_ids = db.post_exercise_ids(message_id)
         was_active = db.clear_post_children(message_id)
         db.upsert_post(
             message_id, when.astimezone(timezone.utc).isoformat(), day, parsed.kind, text,
             edited.astimezone(timezone.utc).isoformat() if edited else None, len(parsed.unparsed),
         )
-        if parsed.kind == "body":
+        if parsed.kind != "template":  # «Вес 82,5» inside a workout post counts too; «вчера» moves it
+            body_day = resolve_day(day, parsed.date)
             if parsed.bodyweight is not None:
-                db.add_body(message_id, day, parsed.bodyweight)
+                db.add_body(message_id, body_day, parsed.bodyweight)
             for k, v in parsed.measurements.items():
-                db.add_measurement(message_id, day, k, v)
-        elif parsed.kind == "template":
+                db.add_measurement(message_id, body_day, k, v)
+        if parsed.kind == "template":
             res.program_id = _store_program(db, message_id, parsed, was_active, ex_id)
             if res.program_id and not db.active_program():
                 db.activate_program(res.program_id)  # the first program needs no question
         elif parsed.kind == "log":
             _store_log(db, message_id, day, parsed, ex_id, res)
+        db.prune_exercises(old_ids - db.post_exercise_ids(message_id))
     program.assign_positions(db)
     if parsed.kind == "log" and res.sets:
         res.records = stats.post_records(db, message_id)
@@ -142,7 +151,7 @@ def reparse_if_needed(db: Db) -> int:
 
 
 def _store_log(db: Db, message_id: int, day: str, parsed: ParsedPost, ex_id, res: IngestResult) -> None:
-    blocks = [b for b in parsed.blocks if b.lines or b.is_day]
+    blocks = [b for b in parsed.blocks if b.lines]  # a bare «Ср не приду» header is not a workout
     for i, b in enumerate(blocks):
         notes = list(b.notes)
         if i == 0:
@@ -177,7 +186,10 @@ def _store_program(db: Db, message_id: int, parsed: ParsedPost, active: bool, ex
 
 
 def forget_post(db: Db, message_id: int) -> bool:
+    used = db.post_exercise_ids(message_id)
     ok = db.delete_post(message_id)
+    with db.tx():
+        db.prune_exercises(used)
     program.assign_positions(db)
     return ok
 
@@ -189,6 +201,15 @@ class ExportedPost:
     message_id: int
     when: datetime
     text: str
+
+
+def _export_date(title: str) -> datetime:
+    """«27.10.2026 19:05:11 UTC+03:00»; older Telegram Desktop builds write no zone (local time then)."""
+    title = title.replace(" UTC", "").strip()
+    try:
+        return datetime.strptime(title, "%d.%m.%Y %H:%M:%S%z")
+    except ValueError:
+        return datetime.strptime(title, "%d.%m.%Y %H:%M:%S").replace(tzinfo=clock.TZ)
 
 
 class _ExportHtml(HTMLParser):
@@ -215,7 +236,7 @@ class _ExportHtml(HTMLParser):
             m = re.match(r"message(\d+)$", a.get("id") or "")
             self._id = int(m.group(1)) if m else None
         elif tag == "div" and "date details" in cls and a.get("title") and self._id is not None:
-            self._when = datetime.strptime(a["title"].replace(" UTC", ""), "%d.%m.%Y %H:%M:%S%z")
+            self._when = _export_date(a["title"])
         elif tag == "div" and cls == "text" and self._id is not None:
             self._buf, self._depth = [], 1
 
@@ -250,7 +271,7 @@ def read_export(path: str | Path) -> list[ExportedPost]:
             if m.get("type") != "message" or not (text := _json_text(m.get("text", ""))).strip():
                 continue
             when = datetime.fromtimestamp(int(m["date_unixtime"]), timezone.utc) if m.get("date_unixtime") \
-                else datetime.fromisoformat(m["date"]).replace(tzinfo=MSK)
+                else datetime.fromisoformat(m["date"]).replace(tzinfo=clock.TZ)
             out.append(ExportedPost(int(m["id"]), when, text))
         return out
     parser = _ExportHtml()
@@ -284,7 +305,7 @@ def import_export(db: Db, path: str | Path, activate_latest: bool = True) -> Imp
     unparsed: list[tuple[int, str]] = []
     for ep in posts:
         if db.is_sent(ep.message_id):
-            continue
+            continue  # the bot's own plans; on a fresh database parse_post spots them by BOT_MARK
         r = ingest_post(db, ep.message_id, ep.when, ep.text)
         kinds[r.kind] = kinds.get(r.kind, 0) + 1
         sets += r.sets

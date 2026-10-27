@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from difflib import SequenceMatcher
 
-AUTO_SCORE = 0.92       # same first word and this similar -> same exercise, silently
+AUTO_SCORE = 0.92       # this similar and only a typo inside one word -> same exercise, silently
 ASK_SCORE = 0.75        # same first word and this similar -> new exercise plus a merge suggestion
 ASK_SCORE_OTHER = 0.85  # different first words need more similarity before asking
 
@@ -57,11 +57,73 @@ LEMMA = {
 }
 
 
+# words that make two otherwise similar names different exercises
+VARIANT_RE = re.compile(
+    r"^(?:стоя|сидя|лежа|узк|широк|обратн|прям|нейтрал|хват|акцент|трицепс|бицепс|груд|наклон|горизонт|вертикал"
+    r"|верхн|нижн|гантел|штанг|блок|тренаж|смит|гриф|кроссовер|канат|одн|поочер|фронт|сумо|румын|голов|колен)"
+)
+# equipment named in the text itself; a name saying «гантели» is never the barbell lift
+EQUIPMENT_WORDS = {"dumbbell": re.compile(r"гантел"), "barbell": re.compile(r"штанг|\bгриф\b|смит")}
+QUAL_NOISE_RE = re.compile(r"\b(?:см|кг|раз|сек|мин|подход\w*|перв\w*|последн\w*|остальн\w*)\b")
+
+
 def norm(name: str) -> str:
     s = name.lower().replace("ё", "е")
     s = re.sub(r"\([^)]*\)", " ", s)
     s = re.sub(r"[^a-zа-я0-9]+", " ", s)
     return " ".join(LEMMA.get(w, w) for w in s.split())
+
+
+def qualifier(name: str) -> str:
+    """Words in brackets that name a variant: «(акцент на трицепс)»; «(30-40 см)» and «(или …)» are not."""
+    parts = []
+    for q in re.findall(r"\(([^)]*)\)", name.lower().replace("ё", "е")):
+        q = " ".join(QUAL_NOISE_RE.sub(" ", re.sub(r"[^a-zа-я ]+", " ", q)).split())
+        if q and not q.startswith("или "):
+            parts.append(q)
+    return " ".join(parts)
+
+
+def norm_full(name: str) -> str:
+    """norm() plus the bracket qualifier: the alias key of a variant."""
+    return " ".join(filter(None, [norm(name), norm(qualifier(name))]))
+
+
+def conflicting(raw: str, target_name: str) -> bool:
+    """The bracket words of a name contradict the exercise its plain alias points to."""
+    qa, qb = qualifier(raw), qualifier(target_name)
+    if not qa or qa == qb:
+        return False
+    if qb:
+        return True
+    plain = set(norm(target_name).split())
+    return any(VARIANT_RE.match(w) and w not in plain for w in qa.split())
+
+
+def equipment_named(n: str) -> set[str]:
+    return {eq for eq, rx in EQUIPMENT_WORDS.items() if rx.search(n)}
+
+
+def equipment_clash(a: str, b: str) -> bool:
+    """One name says dumbbells, the other a barbell."""
+    ea, eb = equipment_named(a), equipment_named(b)
+    return bool(ea and eb and not ea & eb)
+
+
+def safe_auto(a: str, b: str) -> bool:
+    """A silent merge only for a typo inside one word; стоя/сидя, digits or an extra word need the owner."""
+    ta, tb = a.split(), b.split()
+    if len(ta) != len(tb):
+        return False
+    diff = [(x, y) for x, y in zip(ta, tb) if x != y]
+    if not diff:
+        return True
+    if len(diff) > 1:
+        return False
+    x, y = diff[0]
+    if x.isdigit() or y.isdigit() or VARIANT_RE.match(x) or VARIANT_RE.match(y):
+        return False
+    return score(x, y) >= 0.75
 
 
 def display(name: str) -> str:

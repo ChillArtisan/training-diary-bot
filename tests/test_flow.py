@@ -1,4 +1,5 @@
 """Database methods and the live flow: template -> logs -> next day -> edits."""
+import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -115,3 +116,77 @@ def test_settings_body_and_sent(db):
     assert db.is_sent(99) and not db.is_sent(98)
     assert db.post_counts() == {"body": 1}
     assert not db.has_session_on("2026-10-01")
+
+
+def test_variants_are_not_merged_silently(db):
+    a = ingest_post(db, 1, at(0), "Подъём на носки сидя в тренажёре – 3x12 40кг")
+    b = ingest_post(db, 2, at(1), "Подъём на носки стоя в тренажёре – 3x12 60кг")
+    assert b.new_exercises and b.suggestions  # asked, not merged
+    ingest_post(db, 3, at(2), "Отжимания на брусьях (акцент на грудь) 3x10")
+    r = ingest_post(db, 4, at(3), "Отжимания на брусьях (акцент на трицепс) 3x10")
+    assert r.new_exercises == ["Отжимания на брусьях (акцент на трицепс)"]
+    assert ingest_post(db, 5, at(4), "Разнибания ног сидя – 3x12 50кг").new_exercises == []  # a typo merges
+    assert a.kind == "log"
+
+
+def test_dumbbell_aliases_of_a_barbell_lift_split_off(tmp_path):
+    from diary import db as dbmod
+    d = Db(tmp_path / "x.db")
+    bar = d.exercise_by_alias("жим штанги на наклонной")
+    d.add_alias("жим гантелей на наклонной 30", bar)
+    d.add_alias("жим гантелей на наклонной", bar)
+    d.conn.commit()
+    d.conn.execute("PRAGMA user_version = 0")
+    d.conn.close()
+    d = Db(tmp_path / "x.db")
+    dumb = d.exercise_by_alias("жим гантелей на наклонной")
+    assert dumb != bar and d.exercise_by_alias("жим гантелей на наклонной 30") == dumb
+    assert d.exercise(dumb)["equipment"] == "dumbbell"
+    assert d.one("PRAGMA user_version")[0] == len(dbmod.MIGRATIONS)
+
+
+def test_failed_migration_leaves_nothing_half_done(tmp_path, monkeypatch):
+    from diary import db as dbmod
+    d = Db(tmp_path / "m.db")
+    d.conn.close()
+    monkeypatch.setattr(dbmod, "MIGRATIONS", [*dbmod.MIGRATIONS, "ALTER TABLE post ADD COLUMN foo TEXT;\nSELECT * FROM nope;"])
+    with pytest.raises(Exception):
+        Db(tmp_path / "m.db")
+    conn = sqlite3.connect(tmp_path / "m.db")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(post)")]
+    assert "foo" not in cols and conn.execute("PRAGMA user_version").fetchone()[0] == len(dbmod.MIGRATIONS) - 1
+
+
+def test_editing_away_a_typo_drops_the_typo_exercise(db):
+    ingest_post(db, 1, at(0), "Жим лежа 3x8 60кг")
+    r = ingest_post(db, 2, at(1), "Жим лажа узким 3x8 50кг")
+    assert r.new_exercises
+    n = db.exercise_count()
+    ingest_post(db, 2, at(1), "Жим лежа 3x8 50кг", edited=at(2))
+    assert db.exercise_count() == n - 1 and not db.open_suggestions()
+
+
+def test_bare_weekday_note_and_body_weight_in_a_workout(db):
+    pid = ingest_post(db, 1, at(0), TEMPLATE).program_id
+    program.activate(db, pid)
+    assert ingest_post(db, 2, at(1), "Пн не приду, работа").kind == "note"
+    assert program.next_day(db)["ord"] == 0  # the note did not take Monday
+    ingest_post(db, 3, at(2), "Вес 70,8\nЖим штанги лежа – 4x8 60кг")
+    assert db.bodyweight() == 70.8
+    ingest_post(db, 4, at(3), "вчера\n70,4кг")
+    assert db.body_series()[-1]["day"] == (at(3) - timedelta(days=1)).date().isoformat()
+
+
+def test_late_post_does_not_become_the_last_workout(db):
+    ingest_post(db, 1, at(10), "Жим лежа 4x8 60кг - не добавлять")
+    ingest_post(db, 2, at(11), "08.10\nЖим лежа 4x8 75кг")  # a forgotten older workout posted later
+    eid = db.exercise_by_alias("жим лежа")
+    from diary.today import history
+    assert history(db, eid)[0].top == 60
+
+
+def test_exercises_beat_a_wrong_weekday(db):
+    pid = ingest_post(db, 1, at(0), TEMPLATE).program_id
+    program.activate(db, pid)
+    ingest_post(db, 2, at(1), "ВТОРНИК\nЖим штанги лежа – 4x8 60кг\nТяга штанги в наклоне – 4x10 60кг")
+    assert program.next_day(db)["title"] == "ВТОРНИК: НИЗ А"  # matched Monday by the exercises

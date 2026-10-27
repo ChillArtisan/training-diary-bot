@@ -1,8 +1,10 @@
 """SQLite storage. Synchronous on purpose: one owner, a tiny database."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -10,9 +12,46 @@ from . import aliases
 
 SCHEMA = Path(__file__).with_name("schema.sql")
 
-# Changes to tables that already exist. schema.sql only creates what is missing, so a new
-# column or an index on a new column goes here, never into schema.sql. Append only.
-MIGRATIONS: list[str] = []
+
+def _split_equipment_aliases(conn: sqlite3.Connection) -> None:
+    """Aliases saying «гантели» that point to a barbell lift (or back) move to an exercise of their own."""
+    rows = conn.execute(
+        "SELECT a.text_norm, a.exercise_id, x.name FROM alias a JOIN exercise x ON x.id = a.exercise_id"
+    ).fetchall()
+    groups: dict[tuple[int, frozenset[str]], list[str]] = {}
+    for text, eid, name in rows:
+        if aliases.equipment_clash(text, aliases.norm(name)):
+            groups.setdefault((eid, frozenset(aliases.equipment_named(text))), []).append(text)
+    for (_, named), texts in groups.items():
+        name = aliases.display(max(texts, key=lambda t: (not any(c.isdigit() for c in t), len(t))))
+        row = conn.execute("SELECT id FROM exercise WHERE name = ?", (name,)).fetchone()
+        eid = row[0] if row else conn.execute(
+            "INSERT INTO exercise(name, equipment) VALUES(?, ?)",
+            (name, "dumbbell" if "dumbbell" in named else "barbell"),
+        ).lastrowid
+        conn.executemany("UPDATE alias SET exercise_id = ? WHERE text_norm = ?", [(eid, t) for t in texts])
+    if groups:
+        conn.execute("DELETE FROM settings WHERE key = 'parser_version'")  # re-read the posts with the new aliases
+
+
+# Changes to tables that already exist: SQL scripts or functions of the connection. schema.sql only
+# creates what is missing, so a new column or an index on a new column goes here. Append only;
+# each step runs in one transaction together with its user_version bump.
+MIGRATIONS: list[str | Callable[[sqlite3.Connection], None]] = [
+    _split_equipment_aliases,
+]
+
+
+def _statements(script: str) -> Iterator[str]:
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            if buf.strip():
+                yield buf
+            buf = ""
+    if buf.strip():
+        yield buf
 
 
 class Db:
@@ -30,10 +69,20 @@ class Db:
 
     def _migrate(self) -> None:
         version = self.one("PRAGMA user_version")[0]
-        for i, sql in enumerate(MIGRATIONS[version:], start=version + 1):
-            with self.tx():
-                self.conn.executescript(sql)
+        for i, step in enumerate(MIGRATIONS[version:], start=version + 1):
+            self.conn.commit()
+            self.conn.execute("BEGIN")
+            try:
+                if callable(step):
+                    step(self.conn)
+                else:
+                    for stmt in _statements(step):
+                        self.conn.execute(stmt)
                 self.conn.execute(f"PRAGMA user_version = {i}")
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
 
     @contextmanager
     def tx(self):
@@ -51,14 +100,19 @@ class Db:
         return self.conn.execute(sql, args).fetchone()
 
     def _seed(self) -> None:
-        if self.get("seeded"):
+        """Seed synonyms; new ones reach old databases too, without undoing the owner's merges."""
+        digest = hashlib.sha1(json.dumps(aliases.SEED, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:12]
+        if self.get("seed_hash") == digest:
             return
         with self.tx():
             for name, spellings in aliases.SEED.items():
-                eid = self.add_exercise(name, aliases.guess_equipment(name))
-                for s in [name, *spellings]:
-                    self.add_alias(aliases.norm(s), eid)
-            self.set("seeded", "1")
+                keys = [aliases.norm(s) for s in [name, *spellings]]
+                eid = next((e for k in keys if (e := self.exercise_by_alias(k))), None)
+                if eid is None:
+                    eid = self.add_exercise(name, aliases.guess_equipment(name))
+                for k in keys:
+                    self.add_alias(k, eid, replace=False)
+            self.set("seed_hash", digest)
 
     # settings
     def get(self, key: str, default: str | None = None) -> str | None:
@@ -141,11 +195,11 @@ class Db:
         self.conn.execute("UPDATE exercise SET equipment = ? WHERE id = ?", (equipment, eid))
         self.conn.commit()
 
-    def add_alias(self, text_norm: str, eid: int) -> None:
+    def add_alias(self, text_norm: str, eid: int, replace: bool = True) -> None:
         if text_norm:
             self.conn.execute(
-                "INSERT INTO alias(text_norm, exercise_id) VALUES(?, ?) "
-                "ON CONFLICT(text_norm) DO UPDATE SET exercise_id = excluded.exercise_id",
+                "INSERT INTO alias(text_norm, exercise_id) VALUES(?, ?) ON CONFLICT(text_norm) DO "
+                + ("UPDATE SET exercise_id = excluded.exercise_id" if replace else "NOTHING"),
                 (text_norm, eid),
             )
 
@@ -157,9 +211,35 @@ class Db:
 
     def merge_exercises(self, drop: int, keep: int) -> None:
         with self.tx():
-            for table in ("set_entry", "program_item", "alias"):
+            for table in ("set_entry", "program_item", "alias", "goal"):
                 self.conn.execute(f"UPDATE {table} SET exercise_id = ? WHERE exercise_id = ?", (keep, drop))
             self.conn.execute("DELETE FROM exercise WHERE id = ?", (drop,))
+
+    def post_exercise_ids(self, message_id: int) -> set[int]:
+        rows = self.q(
+            """SELECT e.exercise_id FROM set_entry e JOIN session s ON s.id = e.session_id WHERE s.post_id = ?
+               UNION SELECT i.exercise_id FROM program_item i JOIN program_day d ON d.id = i.day_id
+               JOIN program p ON p.id = d.program_id WHERE p.post_id = ?""",
+            message_id, message_id,
+        )
+        return {r[0] for r in rows}
+
+    def prune_exercises(self, ids: set[int]) -> int:
+        """Drop exercises nothing refers to any more: a typo fixed by editing the post."""
+        dropped = 0
+        for eid in ids:
+            row = self.exercise(eid)
+            if row is None or row["name"] in aliases.SEED:
+                continue
+            used = self.one(
+                """SELECT 1 FROM set_entry WHERE exercise_id = ? UNION ALL SELECT 1 FROM program_item
+                   WHERE exercise_id = ? UNION ALL SELECT 1 FROM goal WHERE exercise_id = ? LIMIT 1""",
+                eid, eid, eid,
+            )
+            if not used:
+                self.conn.execute("DELETE FROM exercise WHERE id = ?", (eid,))
+                dropped += 1
+        return dropped
 
     # suggestions
     def add_suggestion(self, eid: int, candidate: int, sc: float) -> int | None:
@@ -207,7 +287,7 @@ class Db:
     def sessions_since(self, date_utc: str) -> list[sqlite3.Row]:
         return self.q(
             """SELECT s.*, p.date_utc FROM session s JOIN post p ON p.message_id = s.post_id
-               WHERE p.date_utc >= ? ORDER BY p.date_utc, s.id""",
+               WHERE p.date_utc >= ? ORDER BY s.day, p.date_utc, s.id""",
             date_utc,
         )
 
@@ -223,7 +303,7 @@ class Db:
     def last_matched_session(self, program_id: int) -> sqlite3.Row | None:
         return self.one(
             """SELECT s.*, p.date_utc FROM session s JOIN post p ON p.message_id = s.post_id
-               WHERE s.program_id = ? AND s.ord IS NOT NULL ORDER BY p.date_utc DESC, s.id DESC LIMIT 1""",
+               WHERE s.program_id = ? AND s.ord IS NOT NULL ORDER BY s.day DESC, p.date_utc DESC, s.id DESC LIMIT 1""",
             program_id,
         )
 
@@ -251,11 +331,19 @@ class Db:
             post_id,
         )
 
-    def sets_before(self, eid: int, date_utc: str) -> list[sqlite3.Row]:
+    def sets_before(self, eid: int, date_utc: str, day: str | None = None) -> list[sqlite3.Row]:
+        """Sets done before a post: on an earlier day, or the same day and posted earlier."""
+        if day is None:
+            return self.q(
+                """SELECT e.* FROM set_entry e JOIN session s ON s.id = e.session_id
+                   JOIN post p ON p.message_id = s.post_id WHERE e.exercise_id = ? AND p.date_utc < ?""",
+                eid, date_utc,
+            )
         return self.q(
             """SELECT e.* FROM set_entry e JOIN session s ON s.id = e.session_id
-               JOIN post p ON p.message_id = s.post_id WHERE e.exercise_id = ? AND p.date_utc < ?""",
-            eid, date_utc,
+               JOIN post p ON p.message_id = s.post_id
+               WHERE e.exercise_id = ? AND (s.day < ? OR (s.day = ? AND p.date_utc < ?))""",
+            eid, day, day, date_utc,
         )
 
     def all_sets(self) -> list[sqlite3.Row]:
@@ -263,13 +351,13 @@ class Db:
         return self.q(
             """SELECT e.*, s.day, x.name AS exercise, p.date_utc FROM set_entry e
                JOIN session s ON s.id = e.session_id JOIN post p ON p.message_id = s.post_id
-               JOIN exercise x ON x.id = e.exercise_id ORDER BY p.date_utc, s.id, e.line_no, e.set_idx"""
+               JOIN exercise x ON x.id = e.exercise_id ORDER BY s.day, p.date_utc, s.id, e.line_no, e.set_idx"""
         )
 
     def sessions_chrono(self) -> list[sqlite3.Row]:
         return self.q(
             """SELECT s.*, p.date_utc FROM session s JOIN post p ON p.message_id = s.post_id
-               ORDER BY p.date_utc, s.id"""
+               ORDER BY s.day, p.date_utc, s.id"""
         )
 
     def all_program_items(self) -> list[sqlite3.Row]:
@@ -295,9 +383,9 @@ class Db:
     def exercise_sets(self, eid: int) -> list[sqlite3.Row]:
         """All sets of an exercise with session context, newest session first."""
         return self.q(
-            """SELECT e.*, s.day, s.rir AS session_rir, s.program_id, s.ord, p.date_utc
+            """SELECT e.*, s.day, s.rir AS session_rir, s.phase AS session_phase, s.program_id, s.ord, p.date_utc
                FROM set_entry e JOIN session s ON s.id = e.session_id JOIN post p ON p.message_id = s.post_id
-               WHERE e.exercise_id = ? ORDER BY p.date_utc DESC, s.id DESC, e.line_no, e.set_idx""",
+               WHERE e.exercise_id = ? ORDER BY s.day DESC, p.date_utc DESC, s.id DESC, e.line_no, e.set_idx""",
             eid,
         )
 

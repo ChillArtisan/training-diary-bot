@@ -117,6 +117,20 @@ CREATE TABLE IF NOT EXISTS sent_post (
     day         TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS goal (
+    id           INTEGER PRIMARY KEY,
+    kind         TEXT NOT NULL,                  -- lift | body
+    exercise_id  INTEGER REFERENCES exercise(id) ON DELETE CASCADE,
+    target       REAL NOT NULL,                  -- lift: one-rep max estimate, kg; body: body weight, kg
+    weight       REAL,                           -- a lift goal written as «80x5»: its weight ...
+    reps         INTEGER,                        -- ... and reps, shown back that way
+    deadline     TEXT,                           -- YYYY-MM-DD or NULL
+    created      TEXT NOT NULL,
+    start_value  REAL,                           -- the level when the goal was set
+    achieved     TEXT                            -- the day it was reached
+);
+CREATE INDEX IF NOT EXISTS goal_exercise ON goal(exercise_id);
+
 CREATE TABLE IF NOT EXISTS settings (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL

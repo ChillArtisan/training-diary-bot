@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import html
+import re
 from dataclasses import dataclass, field
 from datetime import date
 
 from . import movement, plates, program, state
 from .db import Db
-from .recommend import DEFAULT_RIR, Perf, Rec, Target, fmt_weight, gap_factor, recommend, round_weight
+from .recommend import (
+    DEFAULT_RIR, LIGHT_FACTOR, RESTART_AFTER_DAYS, Perf, Rec, Target, fmt_weight, gap_factor, is_deload, recommend,
+    round_weight,
+)
 
-LIGHT_FACTOR = 0.85
-RESTART_AFTER_DAYS = 21
+PCT_RE = re.compile(r"(?P<a>\d{2})(?:\s*[-–]\s*(?P<b>\d{2}))?\s*%\s*(?:от\s*)?(?:1?\s*пм|1?\s*rm)", re.I)
 MODES = {"normal": "", "light": "лёгкий день", "short": "коротко"}
 
 
@@ -20,6 +23,8 @@ class PlanLine:
     scheme: str
     rec: Rec
     skip: bool = False
+    eid: int | None = None   # the exercise actually planned (the replacement for an avoided one)
+    sets: int | None = None
 
     @property
     def text(self) -> str:
@@ -36,6 +41,7 @@ class Plan:
     warmup: str | None = None
     notes: list[str] = field(default_factory=list)
     gap_days: int | None = None
+    day_id: int | None = None
 
 
 def history(db: Db, eid: int) -> list[Perf]:
@@ -51,6 +57,7 @@ def history(db: Db, eid: int) -> list[Perf]:
             perfs.append(Perf(
                 day=date.fromisoformat(r["day"]), reps=[], seconds=[], weights=[], kind=r["weight_kind"],
                 rir=rir if rir is not None else DEFAULT_RIR, target=target, hint=r["hint"], hint_kg=r["hint_kg"],
+                deload=is_deload(r["session_rir"], r["session_phase"]),
             ))
         p = perfs[-1]
         p.reps.append(r["reps"])
@@ -86,9 +93,11 @@ def bar_weight(db: Db) -> float:
 
 def target_for(item, day) -> Target:
     rir = day["rir"] if day["rir"] is not None else DEFAULT_RIR
-    deload = rir >= 4 or "разгруз" in (day["phase"] or "").lower()
+    pct = None
+    if m := PCT_RE.search(day["phase"] or ""):
+        pct = (int(m["a"]) + int(m["b"] or m["a"])) / 200
     return Target(item["sets"], item["reps_min"], item["reps_max"], rir, bool(item["seconds"]), bool(item["to_max"]),
-                  deload)
+                  is_deload(day["rir"], day["phase"]), pct)
 
 
 def gap_days(db: Db, today: date) -> int | None:
@@ -122,14 +131,15 @@ def build_plan(db: Db, today: date, day=None, mode: str = "normal") -> Plan | No
             prefix = f"вместо «{it['name']}» · "
         rec = recommend(t, history(db, eid), today, equipment, bw, steps)
         if mode == "light" and rec.weight is not None:
-            rec.weight = round_weight(rec.weight * LIGHT_FACTOR, equipment, rec.kind, steps)
-            rec.reason += " · лёгкий день −15%"
+            rec.weight = round_weight(rec.weight * LIGHT_FACTOR, equipment, rec.kind, steps, mode="down")
+            rec.reason += f" · лёгкий день −{round((1 - LIGHT_FACTOR) * 100)}%"
         rec.reason = prefix + rec.reason
-        lines.append(PlanLine(name, _scheme(it, rec, sets), rec))
+        lines.append(PlanLine(name, _scheme(it, rec, sets), rec, eid=eid, sets=sets or it["sets"]))
 
-    plan = Plan(day["week_title"], day["title"], lines, mode)
-    first_bar = next((ln for ln, it in zip(lines, items) if not ln.skip and ln.rec.kind == "abs"
-                      and it["equipment"] == "barbell" and (ln.rec.weight or 0) >= 40), None)
+    plan = Plan(day["week_title"], day["title"], lines, mode, day_id=day["id"])
+    equipment_of = {ln.eid: (db.exercise(ln.eid) or {"equipment": None})["equipment"] for ln in lines if ln.eid}
+    first_bar = next((ln for ln in lines if not ln.skip and ln.rec.kind == "abs"
+                      and equipment_of.get(ln.eid) == "barbell" and (ln.rec.weight or 0) >= 40), None)
     if first_bar:
         plan.warmup = f"Разминка ({first_bar.name}): {plates.warmup_text(first_bar.rec.weight, bar_weight(db))}"
     gap = gap_days(db, today)

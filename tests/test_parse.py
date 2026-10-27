@@ -116,3 +116,64 @@ def test_post_kinds():
 def test_unparsed_data_lines():
     p = parse_post("Понедельник. проверка максимума.\n90кг - тяжело.")
     assert p.unparsed == ["90кг - тяжело."]
+
+
+def test_ambiguous_numbers_are_not_sets():
+    assert parse_exercise("Жим лежа 80x5") is None  # weight x reps: unparsed, never 80 sets
+    assert parse_exercise("Жим 4x60кг") is None
+    assert sets("Присед 100x5x3") == [(5, None, 100)] * 3
+    assert sets("Присед 3x5x100") == [(5, None, 100)] * 3
+    assert sets("Жим гантелей 2x24кг 3x10") == [(10, None, 24)] * 3
+
+
+def test_reps_lists_and_weight_lists():
+    assert reps("Подтягивания 3xмакс 12,10,8") == [12, 10, 8]
+    assert weights("Подтягивания 3xмакс 12,10,8") == [None] * 3
+    assert reps("Подтягивания 3xмакс (12, 10, 8)") == [12, 10, 8]
+    assert weights("Жим 3x10 12,5") == [12.5] * 3
+    assert weights("Жим 3x8 60/62,5/65кг") == [60, 62.5, 65]
+    assert weights("Жим 3x8 60кг, 62,5кг, 65кг") == [60, 62.5, 65]
+    assert weights("Жим 3x8 60-65кг") == [60] * 3  # which set had what is unknown: the lower weight
+    assert reps("Жим 3x8 60кг 8,8,7") == [8, 8, 7]
+
+
+def test_ordinals_are_whole_words():
+    assert sets("Присед 3x5 100кг на пятках 2 сек пауза") == [(5, None, 100)] * 3
+    assert len(sets("Жим 3x8 60кг опять 6 в последнем")) == 3
+    assert reps("Жим 3x8 60кг повторил 2 раза") == [8, 8, 8]
+    assert len(sets("Тяга 3x10 50кг четвертый 8")) == 3
+    line = "Сведения в кроссовере 3 x 15 36кг - нужно поймать технику (первые два, 30кг третий)"
+    assert weights(line) == [36, 36, 30]
+
+
+def test_units_and_hints_that_are_not_kilograms():
+    assert parse_exercise("Гантели 3x12 10кг, 20 максимум повторов").hint is None
+    assert sets("Жим 3x10 минимум 60кг") == [(10, None, 60)] * 3
+    assert [s for _, s, _ in parse_exercise("Планка 3x1.5 мин").expand()] == [90, 90, 90]
+
+
+def test_superset_part_with_own_scheme_keeps_no_weight():
+    p = parse_post("Суперсет: жим гантелей 3x10 20кг + отжимания 3xмакс")
+    assert [(e.name, e.weight) for e in p.ex_lines] == [("жим гантелей", 20), ("отжимания", None)]
+
+
+def test_bot_plan_posts_are_not_logs():
+    plan = ("НЕДЕЛЯ 1\nПОНЕДЕЛЬНИК: ВЕРХ А\n\nЖим штанги лежа – 4x6-8 62,5кг\nРазминка (Жим): гриф×10 · 25×5\n"
+            "• Жим штанги лежа: было 4x6 60кг · все по верху → +2,5\n• Тяга: новое — подбери вес\n#план")
+    assert parse_post(plan).kind == "bot"
+    assert parse_post(plan.replace("\n#план", "")).kind == "bot"
+
+
+def test_post_kinds_edge_cases():
+    assert parse_post("Ср не приду, работа").kind == "note"
+    p = parse_post("вчера\n70,6кг")
+    assert (p.kind, p.bodyweight, p.date.days_back) == ("body", 70.6, 1)
+    p = parse_post("Вес 70,8\nЖим лежа 3x8 60кг")
+    assert (p.kind, p.bodyweight) == ("log", 70.8)
+    assert sets("Жим ногами – 3x10 - 150кг") == [(10, None, 150)] * 3
+    assert sets("пресс машина – 3x8-41кг") == [(8, None, 41)] * 3
+    assert sets("Подтягивания узким хватом 3-4 х 6-10.") == [(6, None, None)] * 3
+    assert reps("Присед 5 x 6-8 82,5кг (1-8; 2-8; 3-8; 4-8; 5-") == [6] * 5  # a list cut short is not «8; 2»
+    program = ("НЕДЕЛЯ 1\nПОНЕДЕЛЬНИК: ВЕРХ\nЖим штанги лежа – 4x6-8 60кг\nТяга – 4x8-10 50кг\n\n"
+               "ВТОРНИК: НИЗ\nПрисед – 4x6-8 80кг\nЖим ногами – 3x10-12 100кг")
+    assert parse_post(program).kind == "template"

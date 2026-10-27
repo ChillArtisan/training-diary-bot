@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 from .db import Db
 
 MIN_OVERLAP = 0.3  # share of a day's exercises a log must contain to match it without a weekday
+CLEAR_OVERLAP = 0.6  # ... and to beat the weekday written in the header
+
+
+def _share(exercises: set[int], day_items: set[int]) -> float:
+    return len(exercises & day_items) / len(day_items) if day_items else 0.0
 
 
 def assign_positions(db: Db) -> None:
@@ -33,6 +38,8 @@ def assign_positions(db: Db) -> None:
                 db.set_position(s["id"], prog["id"], last_ord)  # the rest of a workout posted in parts
                 continue
             exercises = db.session_exercise_ids(s["id"])
+            if not exercises:
+                continue  # a header without sets does not take a day of the cycle
             if s["week"] is not None and any(d["week"] == s["week"] for d in days):
                 pool = [d for d in days if d["week"] == s["week"]]
             elif last_ord is not None:
@@ -52,7 +59,12 @@ def _pick(pool, s, exercises: set[int], items: dict[int, set[int]]):
             if len(same) > 1 and s["label"]:
                 labeled = [d for d in same if d["label"].lower() == s["label"].lower()]
                 same = labeled or same
-            return max(same, key=lambda d: len(exercises & items[d["id"]]))  # max keeps the first on ties
+            by_day = max(same, key=lambda d: len(exercises & items[d["id"]]))  # max keeps the first on ties
+            by_ex = max(pool, key=lambda d: len(exercises & items[d["id"]]))
+            # «Ср» written over Friday's workout: the exercises win when they clearly point elsewhere
+            if by_ex is not by_day and _share(exercises, items[by_ex["id"]]) >= CLEAR_OVERLAP                     and _share(exercises, items[by_day["id"]]) < MIN_OVERLAP:
+                return by_ex
+            return by_day
     if not exercises:
         return None
     best = max(pool, key=lambda d: len(exercises & items[d["id"]]))
