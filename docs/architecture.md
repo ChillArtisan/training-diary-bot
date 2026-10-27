@@ -60,7 +60,10 @@ each runs in a transaction and bumps `PRAGMA user_version`, so a database is upg
 
 **Scheduler.** `scheduler_loop` ticks every 30 seconds. Each job runs at most once per period (day or ISO week),
 is marked as done *before* it runs so a failing job cannot loop, and may still run after downtime within its window.
-Times are Moscow time.
+A network failure (Telegram network/server errors, flood wait, timeouts, proxy errors) unmarks the job so a later tick retries it
+within the window, with a growing pause and at most 6 attempts per period (counted in `settings`), then one alert.
+Other errors are alerted once and not retried.
+Times are in the owner's timezone (`DIARY_TZ`, default Europe/Moscow).
 
 | Job | Default time | Catch-up window | Condition |
 | :--- | :--- | :--- | :--- |
@@ -70,12 +73,30 @@ Times are Moscow time.
 | `inactivity` | 12:00 | 10 h | 7+ days without a workout, once per last session, not paused |
 | `backup` | 04:00 | 20 h | always |
 
-**Heartbeat.** The scheduler writes a `heartbeat` file next to the database on every tick.
-The Docker `HEALTHCHECK` fails if the file is older than 5 minutes. On startup the bot reads the previous heartbeat and,
-if the gap exceeds 15 minutes, tells the owner it was down. Updates that arrived meanwhile are not dropped, so posts written during downtime are parsed.
+**Heartbeat and polling health.** The scheduler writes a `heartbeat` file next to the database (atomically) every tick,
+but only while the last successful `getUpdates` is under 3 minutes old; a request middleware on the bot session records that time.
+aiogram retries polling forever and swallows errors, so without this a revoked token, a 409 conflict or a dead proxy would leave a deaf bot with a fresh heartbeat.
+The Docker `HEALTHCHECK` fails if the file is older than 5 minutes. A watchdog task logs an error, sends a best-effort alert and exits the process
+after 15 minutes without a successful poll; `restart: unless-stopped` brings it back. On startup the bot reads the previous heartbeat
+(missing or garbage means unknown downtime) and, if the gap exceeds 15 minutes, tells the owner it was down.
+Telegram keeps unprocessed updates for about 24 hours: after a gap over 23 hours the bot says some posts may be missed and asks the owner
+to forward them (a forwarded channel post is ingested as that post, idempotent by message id) or send a channel export.
+
+**Pairing.** `OWNER_ID` / `CHANNEL_ID` win over the database. Without an owner the bot logs a random 6-digit code at startup; `/start <code>` in a private chat
+claims ownership (five wrong tries lock claiming for ten minutes). The code is never sent to any chat. The channel is bound only by the owner:
+a forwarded channel post (both the bot and the owner must be admins there) or an admin promotion done by the owner.
+Posts from an unbound channel and promotions by strangers are ignored. `/rebind` switches the channel after a confirmation.
+
+**Data directory.** The container runs as uid 1000. At startup the bot checks that the data directory is writable and otherwise exits with code 2 and the fix.
 
 **Backups.** The daily job copies the database with the SQLite backup API (consistent while the bot writes) into `backups/`
-and keeps the 14 newest. On Mondays a copy is also sent to the owner (toggle `backup_send`). `/export` produces a CSV of all sets.
+and keeps the 14 newest; each copy is a single file (journal mode switched off WAL). On Mondays a copy is also sent to the owner (toggle `backup_send`). `/export` produces a CSV of all sets.
+
+**Restore.** The owner sends a `.db` file: it must open as SQLite, pass `integrity_check`, contain `post`, `session` and `set_entry`,
+and its `settings.owner_id` must be absent or the current owner. After confirmation the live database is first copied to `backups/pre-restore-*.db`,
+then the file is copied into the open connection with the backup API (no stale `-wal` can undo it), posts are re-parsed if needed and program positions rebuilt.
+Imports run in a worker thread with their own connection; zip uploads are read only for `result.json` / `messages*.html`, capped at 50 MB unpacked.
+Bot API downloads are limited to 20 MB, so exports should be made without media.
 
 **Error alerts.** Failures in handlers and jobs are logged and reported to the owner, at most once per kind of error per 30 minutes.
 One failing job does not stop the others.
@@ -92,3 +113,12 @@ judged on progress), weekly consistency with streaks and the comeback after a br
 trends and written insights. `diary/charts.py` turns that data into PNGs with matplotlib's object API; `bot/ui.py`
 prepares the data on the event loop and renders in `asyncio.to_thread`, so the shared SQLite connection is never used
 from the worker thread.
+
+## Goals
+
+`diary/goals.py` keeps one goal per exercise (a one-rep-max estimate; `80x5` is converted with Epley and shown back as
+written) and one body-weight goal. The pace is a Theil–Sen trend over the sessions since the last break inside 120 days:
+the median of the slopes between pairs of sessions at least a week apart, with the interquartile slopes giving the date
+range. Deload sessions are left out. With fewer than four points over three weeks there is no forecast, only the current
+level; a pace under 0,1 kg a week is reported as flat rather than as a date years away, and forecasts beyond half a
+year carry a caution, because strength gains slow down. `check_achieved` runs after every live log or body post.

@@ -1,11 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "training-diary-bot"
-version = "1.1.0"
+dynamic = ["version", "dependencies"]
 description = "Telegram bot that turns a free-text gym diary channel into a training coach"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"
-dependencies = ["aiogram>=3.26", "aiohttp-socks>=0.10", "matplotlib>=3.9"]
+
+[tool.setuptools.dynamic]
+version = { attr = "diary.__version__" }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["bot*", "diary*"]
+
+[tool.setuptools.package-data]
+diary = ["schema.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -13,3 +26,11 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+extend-exclude = ["examples/demo_export"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]  # long diary-text lines are normal here; real bugs (F, E7) still fail the build
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F811"]  # pytest fixtures imported from another test module

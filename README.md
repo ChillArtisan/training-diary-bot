@@ -49,7 +49,7 @@ The bot speaks Russian (it was built for a real Russian-speaking diary); the cod
 
 Exercise names are matched through aliases, light lemmatization and fuzzy matching;
 when two names are only *probably* the same, the bot asks with two buttons instead of guessing.
-On the author's real diary (174 posts over 13 months, several different programs) it parses 99% of exercise lines.
+On the author's private diary export (174 posts over 13 months, several different programs) about 99% of exercise lines parsed when last measured by hand; that data is not published. CI checks the synthetic demo export in `examples/`.
 
 **Recommends weights.** `diary/recommend.py` is a set of pure functions:
 
@@ -90,14 +90,18 @@ a Sunday summary (sessions, tonnage, records, streak, body weight), a gentle not
   Sent after every logged workout;
 - *weekly volume per muscle group* against the common 10–20 sets guideline, push/pull balance;
 - body weight with a 7-day average and measurement changes;
+- *goals with a forecast*: `/goal жим лёжа 100 к лету` measures your pace with a robust trend (the median of pairwise
+  slopes since the last break, so one great or awful day barely moves it), says roughly when the goal comes, with a range,
+  and whether the deadline holds or what weekly gain it needs. The strength chart shows the goal line and the projection;
+  reached goals are congratulated once;
 - a monthly report on the 1st and a chart with the Sunday summary.
 
 **Runs without a maintainer.**
 
-- zero-config pairing: only `BOT_TOKEN` is required — forward any channel post to the bot and Telegram itself confirms you are an admin there;
+- pairing without config: only `BOT_TOKEN` is required. The first start logs a one-time pair code; send `/start <code>` to the bot, then forward it a channel post (Telegram confirms you are an admin there). `OWNER_ID` / `CHANNEL_ID` pin both and win over the database. `/rebind` moves the bot to another channel;
 - parser upgrades re-read every stored post automatically (`PARSER_VERSION`), schema changes go through `PRAGMA user_version` migrations;
-- daily SQLite backups (14 kept), a weekly copy sent to the owner, `/export` to CSV;
-- Docker healthcheck on a heartbeat file, errors reported to the owner at most once per 30 minutes, a "was down for N minutes" note after outages; posts written during downtime are still processed.
+- daily SQLite backups (14 kept), a weekly copy sent to the owner, `/export` to CSV. To restore, send the backup `.db` file to the bot: it is validated, the current database is backed up first, then you confirm;
+- Docker healthcheck on a heartbeat file, errors reported to the owner at most once per 30 minutes, a "was down for N minutes" note after outages. The healthcheck also goes red when polling stops working (revoked token, 409 conflict, dead proxy), and after 15 minutes without a successful poll the bot exits so Docker restarts it. Telegram keeps unprocessed updates for about 24 hours: posts written during a shorter downtime are processed on return; after a longer one, forward the missing posts to the bot or send a channel export.
 
 ## How the weights are chosen
 
@@ -145,6 +149,7 @@ All commands go to the bot in a private chat with the owner.
 | `/analytics` | Consistency calendar, weekly chart, volume per muscle group and written insights |
 | `/progress` | Strength chart: pick an exercise with buttons or `/progress жим лёжа` |
 | `/kpd` | Efficiency of recent sessions with a chart |
+| `/goal жим лёжа 100 к 01.06` | Set a goal (`100x5`, `вес 75`, `к лету`, `через 3 месяца` work too); `/goal` lists goals with forecasts |
 | `/stats` | Overall picture |
 | `/week` | Weekly summary |
 | `/body` | Body weight chart and measurements |
@@ -154,14 +159,15 @@ All commands go to the bot in a private chat with the owner.
 | `/alias икры стоя = Подъём на носки стоя` | Teach the bot a name |
 | `/equip жим ногами = тренажёр` | Set an exercise's equipment type |
 | `/forget <link>` | Forget a channel post |
-| `/import` | Import a channel export (`result.json`, `messages.html` or a zip) |
+| `/import` | Import a channel export (`result.json`, `messages.html` or a zip); export without media, bots can download files up to 20 MB |
+| `/rebind` | Switch to another channel (forward a post from it) |
 | `/export` | All sets as CSV |
-| `/backup` | Send a copy of the database |
+| `/backup` | Send a copy of the database; send a `.db` file back to restore |
 | `/settings`, `/set key value` | Reminder times, toggles, bar weight, dumbbell rack |
-| `/status` | Bot state |
-| `/start`, `/help` | Pairing and the command list |
+| `/status` | Bot state and version |
+| `/start <code>`, `/help` | Claim the bot with the pair code, command list |
 
-You can also send a workout to the bot directly; it posts it to the channel.
+You can also send a workout to the bot directly; it posts it to the channel. A channel post forwarded to the bot is read as that post (useful after a long downtime).
 
 ## Architecture
 
@@ -171,7 +177,7 @@ flowchart LR
     DM[Owner DM<br/>commands, buttons, files] --> BOT
     subgraph BOT[bot/ · aiogram 3]
         R1[channel.py] --> I
-        R2[owner.py]
+        R2[owner/]
         S[scheduler.py<br/>morning · evening · Sunday · backup]
     end
     I[diary/ingest.py] --> P[diary/parse.py]
@@ -197,6 +203,7 @@ diary/                  pure logic, no Telegram
   today.py              builds and renders the day's plan
   stats.py              records, progress, weekly summary
   analytics.py          session KPD, consistency, volume per muscle group, insights
+  goals.py              goals: robust trend, forecast, deadlines
   charts.py             PNG charts (matplotlib object API, safe in a worker thread)
   movement.py           exercise alternatives for /swap and /avoid
   plates.py             plates per side, warm-up ramp
@@ -207,7 +214,9 @@ diary/                  pure logic, no Telegram
 bot/                    aiogram 3 layer
   __main__.py           startup, polling, downtime notice, command menu
   channel.py            channel posts and edits
-  owner.py              owner commands and buttons, pairing
+  owner/                owner commands and buttons, one module per area (plan, progress, data, restore, settings, pairing, text)
+  health.py             heartbeat, polling watchdog, writable-data check
+  pending.py            short-lived owner prompts with expiry
   ui.py                 persistent keyboard, chart delivery
   scheduler.py          timed jobs, heartbeat
   common.py             identity, error alerts, helpers
@@ -223,14 +232,17 @@ docs/                   architecture notes, demo.svg
 ```bash
 git clone https://github.com/ChillArtisan/training-diary-bot && cd training-diary-bot
 cp .env.example .env          # put BOT_TOKEN from @BotFather there
+mkdir -p data import          # the container runs as uid 1000; create the folders as that user
 docker compose build && docker compose up -d
+docker compose logs training_diary_bot | grep "Pair code"
 ```
 
 1. Add the bot to your diary channel as an admin with «Post messages».
-2. Send `/start` to the bot and forward it any post from the channel.
-3. Optional: send the bot your channel export (`result.json`, `messages.html` or a zip) to import the history.
+2. Send `/start <pair code>` to the bot (the code is in the log line above), then forward it any post from the channel.
+3. Optional: send the bot your channel export (`result.json`, `messages.html` or a zip, exported without media: Telegram gives bots files up to 20 MB) to import the history.
 
-`PROXY_URL` (http or socks5) is supported for networks where Telegram is blocked.
+If `data/` was created by Docker as root, the bot says so and exits with code 2: `sudo chown 1000:1000 data import`.
+`PROXY_URL` (http or socks5) is supported for networks where Telegram is blocked; `DIARY_TZ` sets the timezone (default `Europe/Moscow`).
 
 ## Try it without Telegram
 
@@ -245,7 +257,8 @@ python -m diary --db demo.db cycle
 ## Development
 
 ```bash
-pip install -r requirements.txt -c constraints.txt pytest
+pip install -r requirements.txt -c constraints.txt -r requirements-dev.txt
+ruff check .
 pytest -q
 ```
 

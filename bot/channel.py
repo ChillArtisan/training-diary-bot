@@ -8,7 +8,7 @@ from aiogram import Bot, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import ChatMemberUpdated, Message, ReactionTypeEmoji
 
-from diary import analytics
+from diary import analytics, clock, goals
 from diary.db import Db
 from diary.ingest import IngestResult, ingest_post
 
@@ -46,6 +46,9 @@ async def report(bot: Bot, db: Db, ident: Identity, res: IngestResult, live: boo
             lines.append("🔥 Рекорд!\n" + "\n".join(html.escape(r.text()) for r in res.records))
         if lines:
             await dm(bot, ident, "\n\n".join(lines))
+    if live and res.kind in ("log", "body"):
+        for g in goals.check_achieved(db, clock.today()):
+            await dm(bot, ident, f"🏁 Цель взята: {html.escape(g.title)}! Поставь следующую — /goal.")
     if res.resumed:
         await dm(bot, ident, "С возвращением! Пауза снята, напоминания снова включены.")
     if res.suggestions and ident.owner_id:  # one question at a time; each answer brings the next
@@ -65,15 +68,12 @@ def build_channel_router(db: Db, ident: Identity) -> Router:
 
     def ours(event) -> bool:
         chat = event.chat
-        return chat.type == "channel" and (ident.channel_id is None or chat.id == ident.channel_id)
+        return chat.type == "channel" and ident.channel_id is not None and chat.id == ident.channel_id
 
     router.channel_post.filter(ours)
     router.edited_channel_post.filter(ours)
 
     async def process(message: Message, bot: Bot, edited: bool) -> None:
-        if ident.channel_id is None:
-            ident.set_channel(message.chat.id)
-            await dm(bot, ident, f"Подключился к каналу «{html.escape(message.chat.title or '')}».")
         if db.is_sent(message.message_id):
             return
         text = message.text or message.caption
@@ -101,12 +101,14 @@ def build_channel_router(db: Db, ident: Identity) -> Router:
         if chat.type != "channel":
             return
         if member.status == "administrator":
-            if ident.channel_id is None:
-                ident.set_channel(chat.id)
+            by_owner = update.from_user is not None and update.from_user.id == ident.owner_id
+            if ident.channel_id is None and by_owner:
+                ident.set_channel(chat.id)  # only the owner can bind a channel
             if chat.id != ident.channel_id:
+                if not by_owner:
+                    log.warning("ignored admin promotion in channel %s by user %s", chat.id,
+                                update.from_user.id if update.from_user else None)
                 return
-            if ident.owner_id is None and update.from_user and not update.from_user.is_bot:
-                ident.set_owner(update.from_user.id)  # whoever made the bot an admin runs this channel
             note = "" if getattr(member, "can_post_messages", False) else \
                 "\n⚠️ Нет права «Публикация сообщений» — не смогу присылать программу в канал."
             await dm(bot, ident, f"Подключился к каналу «{html.escape(chat.title or '')}». "

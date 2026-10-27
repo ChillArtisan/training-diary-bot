@@ -6,21 +6,26 @@ import html
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Awaitable, Callable
 
+import aiohttp
 from aiogram import Bot
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.types import FSInputFile
+from python_socks import ProxyError
 
-from diary import analytics, backup, charts, program, state, stats
+from diary import analytics, backup, charts, goals, program, state, stats
 from diary.db import Db
 from diary.today import RESTART_AFTER_DAYS, gap_days
 
-from . import prefs, ui
+from . import health, prefs, ui
 from .common import Alerts, Identity, dm, kb, now_msk, post_plan
 
 log = logging.getLogger(__name__)
 TICK = 30
+MAX_ATTEMPTS = 6    # per job and period; a retryable failure is tried again on a later tick
+RETRYABLE = (TelegramNetworkError, TelegramRetryAfter, TelegramServerError, TimeoutError,
+             aiohttp.ClientError, ConnectionError, ProxyError)
 INACTIVE_DAYS = 7
 MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",
           "ноябрь", "декабрь"]
@@ -57,18 +62,20 @@ def can_nag(db: Db, now: datetime) -> bool:
 
 
 async def run_morning(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
-    await post_plan(bot, db, ident)
+    if db.get("morning_posted") != now.date().isoformat():  # a retry after a failed DM must not post twice
+        await post_plan(bot, db, ident)
+        db.set("morning_posted", now.date().isoformat())
     gap = gap_days(db, now.date())
     if gap and gap > RESTART_AFTER_DAYS:
-        await dm(bot, ident, f"Перерыв {gap} дн. Начать цикл с первой недели?",
+        await dm(bot, ident, f"Перерыв {gap} дн. Начать цикл с первой недели?", strict=True,
                  reply_markup=kb([("Да, с начала", "restart")]))
 
 
 async def run_nudge(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
     day = program.next_day(db)
     if day:
-        await dm(bot, ident, f"Сегодня по плану «{day['title']}». Если был в зале — запиши в канал. "
-                             "Если нет — ничего, день подождёт.",
+        await dm(bot, ident, f"Сегодня по плану «{html.escape(day['title'])}». Если был в зале — запиши в канал. "
+                             "Если нет — ничего, день подождёт.", strict=True,
                  reply_markup=kb([("Пропустить этот день", "skipday"), ("Сделаю позже", "later")]))
 
 
@@ -76,16 +83,21 @@ async def run_summary(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
     text = stats.weekly_summary(db, now.date())
     c = analytics.consistency(db, now.date())
     png = await ui.render(charts.weekly, analytics.weekly_series(db, now.date()), c.planned)
-    if png and ident.owner_id and len(text) <= 1000:
-        await bot.send_photo(ident.owner_id, ui.photo(png, "week"), caption=html.escape(text))
+    caption = ui.caption_fits(text)
+    if png and ident.owner_id and caption is not None:
+        await bot.send_photo(ident.owner_id, ui.photo(png, "week"), caption=caption)
     else:
-        await dm(bot, ident, html.escape(text))
+        await dm(bot, ident, html.escape(text), strict=True)
+    if summary := goals.summary(db, now.date()):
+        await dm(bot, ident, html.escape(summary))
 
 
 async def run_monthly(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
     if ident.owner_id:
         prev = (now.date().replace(day=1) - timedelta(days=1))
         await ui.send_analytics(bot, ident.owner_id, db, now.date(), title=f"📊 Итоги: {MONTHS[prev.month - 1]}")
+        if summary := goals.summary(db, now.date()):
+            await dm(bot, ident, html.escape(summary))
 
 
 def monthly(d: date) -> str:
@@ -94,17 +106,18 @@ def monthly(d: date) -> str:
 
 async def run_inactivity(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
     last = db.last_session_day()
-    db.set("inactivity_for", last or "")
     gap = gap_days(db, now.date())
     buttons = kb([("Цикл с начала", "restart")]) if gap and gap > RESTART_AFTER_DAYS else None
     await dm(bot, ident, f"{gap} дней без записей. Болеешь или уехал — /pause, и я замолчу. "
-                         "Готов вернуться — /plan покажет веса на вкат.", reply_markup=buttons)
+                         "Готов вернуться — /plan покажет веса на вкат.", strict=True, reply_markup=buttons)
+    db.set("inactivity_for", last or "")  # only after it went out, or a retry would find the job already done
 
 
 async def run_backup(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
     path = backup.make_backup(db, now.date())
     if now.weekday() == 0 and prefs.on(db, "backup_send") and ident.owner_id:
-        await bot.send_document(ident.owner_id, FSInputFile(path), caption="Еженедельная копия базы дневника.",
+        await bot.send_document(ident.owner_id, FSInputFile(path),
+                                caption="Еженедельная копия базы. Чтобы восстановить — просто пришли этот файл мне.",
                                 disable_notification=True)
 
 
@@ -133,15 +146,34 @@ JOBS = [
 
 
 def due(job: Job, db: Db, now: datetime) -> bool:
-    if db.get(f"job:{job.name}") == job.period(now.date()):
+    period = job.period(now.date())
+    if db.get(f"job:{job.name}") == period:
         return False
+    tries = db.get_json(f"jobtry:{job.name}")
+    if tries and tries["period"] == period and now.timestamp() < tries["next"]:
+        return False  # backing off after a failed attempt
     hh, mm = job.at(db)
     start = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
     return start <= now < start + job.window and job.when(db, now)
 
 
 def heartbeat(db: Db) -> None:
-    Path(db.path.parent / "heartbeat").write_text(now_msk().isoformat())
+    health.write_heartbeat(health.heartbeat_path(db.path))
+
+
+async def retry_later(job: Job, db: Db, ident: Identity, alerts: Alerts, bot: Bot, now: datetime,
+                      exc: BaseException) -> None:
+    """Unmark a job that failed on a network error so a later tick retries it; give up after MAX_ATTEMPTS."""
+    period = job.period(now.date())
+    tries = db.get_json(f"jobtry:{job.name}")
+    n = tries["n"] + 1 if tries and tries["period"] == period else 1
+    delay = exc.retry_after if isinstance(exc, TelegramRetryAfter) else min(60 * n, 600)
+    db.set_json(f"jobtry:{job.name}", {"period": period, "n": n, "next": now.timestamp() + delay})
+    if n >= MAX_ATTEMPTS:
+        await alerts.report(bot, ident, f"задача {job.name}", RuntimeError(f"сдаюсь после {n} попыток: {exc}"))
+        return
+    log.warning("job %s failed (%s), attempt %d of %d", job.name, exc, n, MAX_ATTEMPTS)
+    db.unset(f"job:{job.name}")
 
 
 async def tick(bot: Bot, db: Db, ident: Identity, alerts: Alerts, now: datetime | None = None) -> list[str]:
@@ -153,15 +185,21 @@ async def tick(bot: Bot, db: Db, ident: Identity, alerts: Alerts, now: datetime 
                 db.set(f"job:{job.name}", job.period(now.date()))  # mark first: a failing job must not loop
                 await job.run(bot, db, ident, now)
                 ran.append(job.name)
+        except RETRYABLE as e:
+            await retry_later(job, db, ident, alerts, bot, now, e)
         except Exception as e:  # noqa: BLE001 - one broken job must not stop the others
             await alerts.report(bot, ident, f"задача {job.name}", e)
     return ran
 
 
-async def scheduler_loop(bot: Bot, db: Db, ident: Identity, alerts: Alerts) -> None:
+async def scheduler_loop(bot: Bot, db: Db, ident: Identity, alerts: Alerts, poll: health.Health | None = None) -> None:
     while True:
+        if poll is None or poll.polling_ok():  # a deaf bot must look unhealthy
+            try:
+                heartbeat(db)
+            except Exception as e:  # noqa: BLE001 - a full disk must not stop the jobs
+                log.error("heartbeat not written: %s", e)
         try:
-            heartbeat(db)
             await tick(bot, db, ident, alerts)
         except Exception as e:  # noqa: BLE001
             await alerts.report(bot, ident, "планировщик", e)
