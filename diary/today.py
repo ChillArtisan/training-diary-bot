@@ -158,6 +158,11 @@ def _header(plan: Plan) -> list[str]:
     return [h for h in (plan.week_title, title) if h]
 
 
+def render_post(plan: Plan) -> str:
+    """What goes to the channel: only the program in the owner's format, ready to copy and fill in."""
+    return "\n".join([*_header(plan), "", *(ln.text for ln in plan.lines if not ln.skip)])
+
+
 def render_text(plan: Plan) -> str:
     body = [ln.text for ln in plan.lines if not ln.skip]
     why = [f"• {ln.name}: {ln.rec.reason}" for ln in plan.lines]

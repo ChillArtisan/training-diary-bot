@@ -80,7 +80,7 @@ def test_morning_posts_plan_once(env):
     db, ident, alerts, bot = env
     monday = datetime(2026, 10, 26, 8, 5, tzinfo=MSK)
     assert "morning" in run(tick(bot, db, ident, alerts, monday))
-    assert bot.sent[-1][0] == ident.channel_id and "<pre>" in bot.sent[-1][1]
+    assert bot.sent[-1][0] == ident.channel_id and bot.sent[-1][1].startswith("НЕДЕЛЯ 1")
     assert "morning" not in run(tick(bot, db, ident, alerts, monday + timedelta(minutes=5)))
 
 

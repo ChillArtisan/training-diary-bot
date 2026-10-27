@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import html
 import logging
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import ChatMemberUpdated, Message, ReactionTypeEmoji
 
-from diary import analytics, clock, goals
+from diary import analytics, clock, goals, stats
 from diary.db import Db
 from diary.ingest import IngestResult, ingest_post
 
@@ -63,6 +64,86 @@ async def report(bot: Bot, db: Db, ident: Identity, res: IngestResult, live: boo
             await dm(bot, ident, f"Программа «{html.escape(prog['name'])}» активна. Первый день — /plan.")
 
 
+async def react(bot: Bot, chat_id: int | None, message_id: int, emoji: str | None) -> None:
+    if not chat_id or not emoji:
+        return
+    try:
+        await bot.set_message_reaction(chat_id, message_id, [ReactionTypeEmoji(emoji=emoji)])
+    except TelegramAPIError as e:
+        log.warning("reaction failed: %s", e)
+
+
+# A workout is posted at the start (often a copy of the plan) and edited set by set, so its report
+# (KPD, records, unreadable lines, name questions) waits until the post has been quiet for `log_settle` minutes.
+LIVE_KEY = "live_posts"
+KEEP_DONE = timedelta(days=3)
+
+
+def settle_minutes(db: Db) -> int:
+    return int(prefs.get(db, "log_settle"))
+
+
+def forget_workout(db: Db, message_id: int) -> None:
+    posts = db.get_json(LIVE_KEY, {})
+    if posts.pop(str(message_id), None) is not None:
+        db.set_json(LIVE_KEY, posts)
+
+
+async def track_workout(bot: Bot, db: Db, ident: Identity, res: IngestResult) -> None:
+    posts = db.get_json(LIVE_KEY, {})
+    entry = posts.setdefault(str(res.message_id), {})
+    entry["at"] = clock.now().isoformat()
+    entry["unparsed"] = res.unparsed  # the latest text decides: a line fixed later is not reported
+    entry["suggestions"] = sorted(set(entry.get("suggestions", [])) | set(res.suggestions))
+    entry["resumed"] = bool(entry.get("resumed") or res.resumed)
+    db.set_json(LIVE_KEY, posts)
+    if entry.get("done"):
+        # corrected after the report: refresh the reaction, mention only lines that were not mentioned yet
+        res.records = stats.post_records(db, res.message_id)
+        await react(bot, ident.channel_id, res.message_id, reaction_for(res))
+        fresh = [u for u in res.unparsed if u not in entry.get("told", [])]
+        if fresh:
+            entry["told"] = entry.get("told", []) + fresh
+            db.set_json(LIVE_KEY, posts)
+            await report(bot, db, ident, IngestResult(res.message_id, "log", unparsed=fresh), live=False)
+        return
+    await react(bot, ident.channel_id, res.message_id, "✍")  # in progress
+    if settle_minutes(db) == 0:
+        await settle_workouts(bot, db, ident)
+
+
+async def settle_workouts(bot: Bot, db: Db, ident: Identity, now: datetime | None = None) -> int:
+    """Report the workouts nobody has edited for a while. Called by the scheduler."""
+    now = now or clock.now()
+    wait = timedelta(minutes=settle_minutes(db))
+    posts = db.get_json(LIVE_KEY, {})
+    done = 0
+    for key, entry in list(posts.items()):
+        quiet = now - datetime.fromisoformat(entry["at"])
+        if entry.get("done"):
+            if quiet > KEEP_DONE:
+                del posts[key]
+            continue
+        if quiet < wait:
+            continue
+        mid = int(key)
+        post = db.post(mid)
+        if not post or post["kind"] != "log":
+            del posts[key]
+            continue
+        open_ids = [s for s in entry.get("suggestions", []) if (row := db.suggestion(s)) and row["status"] == "open"]
+        res = IngestResult(mid, "log", sets=len(db.post_sets(mid)), unparsed=entry.get("unparsed", []),
+                           suggestions=open_ids, records=stats.post_records(db, mid),
+                           resumed=entry.get("resumed", False))
+        entry.update(done=True, told=list(res.unparsed))
+        db.set_json(LIVE_KEY, posts)  # marked first: a failed DM must not repeat the report every tick
+        await react(bot, ident.channel_id, mid, reaction_for(res))
+        await report(bot, db, ident, res, live=True)
+        done += 1
+    db.set_json(LIVE_KEY, posts)
+    return done
+
+
 def build_channel_router(db: Db, ident: Identity) -> Router:
     router = Router(name="channel")
 
@@ -80,11 +161,12 @@ def build_channel_router(db: Db, ident: Identity) -> Router:
         if not text:
             return
         res = ingest_post(db, message.message_id, message.date, text, message.edit_date if edited else None)
+        if res.kind == "log" and res.sets:
+            await track_workout(bot, db, ident, res)
+            return
+        forget_workout(db, message.message_id)  # an edit may have turned a workout into something else
         if emoji := reaction_for(res):
-            try:
-                await bot.set_message_reaction(message.chat.id, message.message_id, [ReactionTypeEmoji(emoji=emoji)])
-            except TelegramAPIError as e:
-                log.warning("reaction failed: %s", e)
+            await react(bot, message.chat.id, message.message_id, emoji)
         await report(bot, db, ident, res, live=not edited)
 
     @router.channel_post()

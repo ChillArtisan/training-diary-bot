@@ -19,6 +19,7 @@ from diary.db import Db
 from diary.today import RESTART_AFTER_DAYS, gap_days
 
 from . import health, prefs, ui
+from .channel import settle_workouts
 from .common import Alerts, Identity, dm, kb, now_msk, post_plan
 
 log = logging.getLogger(__name__)
@@ -189,6 +190,11 @@ async def tick(bot: Bot, db: Db, ident: Identity, alerts: Alerts, now: datetime 
             await retry_later(job, db, ident, alerts, bot, now, e)
         except Exception as e:  # noqa: BLE001 - one broken job must not stop the others
             await alerts.report(bot, ident, f"задача {job.name}", e)
+    try:
+        if await settle_workouts(bot, db, ident):
+            ran.append("settle")
+    except Exception as e:  # noqa: BLE001
+        await alerts.report(bot, ident, "итог тренировки", e)
     return ran
 
 

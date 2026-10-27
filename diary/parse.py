@@ -10,7 +10,6 @@ import re
 from dataclasses import dataclass, field
 
 PARSER_VERSION = 3  # bump on any grammar change: stored posts are re-parsed on startup
-BOT_MARK = "#план"  # last line of every plan the bot posts to the channel; such posts are never logs
 
 NUM = r"\d+(?:[.,]\d+)?"
 
@@ -46,7 +45,7 @@ MEASURE_RE = re.compile(rf"^\s*(?P<k>обхват\s+[^:\d]+?|рост)\s*:?\s*(?
 _DATE = r"(?:(?P<rel>позавчера|вчера)|(?<![\d.,])(?P<d>\d{1,2})[./](?P<m>\d{1,2})(?:[./](?P<y>\d{4}|\d{2}))?(?![\d.,]))"
 DATE_LINE_RE = re.compile(rf"^\s*{_DATE}\s*[:.]?\s*$", re.I)
 DATE_IN_RE = re.compile(_DATE, re.I)
-# a plan the bot posted: «• Жим лёжа: было 4x6 60кг · …» lines under the copyable block
+# a plan with the bot's reasons (1.2.0 posted them to the channel): «• Жим лёжа: было 4x6 60кг · …»
 BOT_REASON_RE = re.compile(r"^•\s*[^:\n]{2,80}:\s*(?:было|новое|вместо|в /avoid)", re.I)
 
 # weights
@@ -533,7 +532,7 @@ def parse_post(text: str) -> ParsedPost:
 
     if len(nonempty) == 1 and (bm := BODY_ONLY_RE.match(nonempty[0])):
         return ParsedPost("body", [], [], [], _f(bm["w"]))
-    if BOT_MARK in nonempty or sum(1 for ln in nonempty if BOT_REASON_RE.match(ln)) >= 2:
+    if sum(1 for ln in nonempty if BOT_REASON_RE.match(ln)) >= 2:
         return ParsedPost("bot", [], [], [])
 
     ctx: dict = {}

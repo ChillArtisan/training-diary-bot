@@ -630,16 +630,16 @@ def test_caption_is_shortened_before_escaping():
     assert ui.caption_fits(plain) is None and ui.caption("short <") == "short &lt;"
 
 
-def test_plan_posted_to_the_channel_ends_with_the_mark(env):
+def test_plan_in_the_channel_is_only_the_program(env):
     from bot.common import post_plan
-    from diary.parse import BOT_MARK
+    from diary import clock, state
+    from diary.parse import parse_post
     db, ident, alerts, bot = env
     assert run(post_plan(bot, db, ident))
     last = bot.sent[-1][1]
-    assert last.endswith("\n" + BOT_MARK) and last.rindex("</pre>") < last.rindex(BOT_MARK)
-    from datetime import date
-    from diary import clock, state
-    assert state.plan_note(db, clock.today()) is not None or state.plan_note(db, date.today()) is not None
+    assert last.startswith("НЕДЕЛЯ 1") and "Почему" not in last and "•" not in last and "<" not in last
+    assert parse_post(last).kind != "bot"  # the owner copies it and fills it in: that copy is a workout
+    assert state.plan_note(db, clock.today()) is not None
 
 
 def test_status_shows_package_version():
@@ -647,3 +647,50 @@ def test_status_shows_package_version():
     import diary
     assert version_text("dev") == diary.__version__
     assert version_text("abc123") == f"{diary.__version__} [abc123]"
+
+
+# ---------- workouts edited during the session ----------
+
+def channel_post(text, mid=500, edit_date=None):
+    return Message(message_id=mid, date=NOW, chat=Chat(id=CHANNEL, type="channel"), text=text, edit_date=edit_date)
+
+
+def reactions(session):
+    from aiogram.methods import SetMessageReaction
+    return [(c.message_id, c.reaction[0].emoji) for c in session.of(SetMessageReaction)]
+
+
+def test_edit_with_a_unix_edit_date_is_stored(tmp_path, monkeypatch):
+    db, ident = make_ident(tmp_path, monkeypatch, owner=7, channel=CHANNEL)
+    dp, bot, session = build(db, ident)
+    feed(dp, bot, channel_post=channel_post("Жим штанги лежа – 4x8 60кг"))
+    edited = channel_post("Жим штанги лежа – 4x8 62,5кг", edit_date=int(NOW.timestamp()) + 600)
+    feed(dp, bot, edited_channel_post=edited)
+    assert {r["weight"] for r in db.post_sets(500)} == {62.5}
+    assert db.post(500)["edited_utc"] and not any("Ошибка" in t for t in texts(session))
+
+
+def test_workout_report_waits_until_the_post_is_quiet(tmp_path, monkeypatch):
+    from bot.channel import LIVE_KEY, settle_workouts
+    from diary import clock
+    db, ident = make_ident(tmp_path, monkeypatch, owner=7, channel=CHANNEL)
+    dp, bot, session = build(db, ident)
+    feed(dp, bot, channel_post=channel_post("Жим штанги лежа – 4x8 60кг\n85кг - тяжело"))
+    edited = channel_post("Жим штанги лежа – 4x8 60кг\nТяга 3x10 50кг\n90кг - тяжело",
+                          edit_date=int(NOW.timestamp()) + 300)
+    feed(dp, bot, edited_channel_post=edited)
+    assert reactions(session) == [(500, "✍"), (500, "✍")] and texts(session) == []  # nothing while editing
+    assert run(settle_workouts(bot, db, ident, clock.now() + timedelta(minutes=10))) == 0
+    assert run(settle_workouts(bot, db, ident, clock.now() + timedelta(minutes=41))) == 1
+    said = "\n".join(texts(session))
+    assert "90кг - тяжело" in said and "85кг" not in said  # only the final text is reported
+    assert reactions(session)[-1] == (500, "🤔") and db.get_json(LIVE_KEY)["500"]["done"]
+    assert run(settle_workouts(bot, db, ident, clock.now() + timedelta(minutes=90))) == 0  # once
+
+
+def test_settle_zero_reports_at_once(tmp_path, monkeypatch):
+    db, ident = make_ident(tmp_path, monkeypatch, owner=7, channel=CHANNEL)
+    db.set("log_settle", "0")
+    dp, bot, session = build(db, ident)
+    feed(dp, bot, channel_post=channel_post("Жим штанги лежа – 4x8 60кг"))
+    assert reactions(session)[-1] == (500, "👍")

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1 - 2026-10-27
+
+- Fixed: editing a channel post failed (`AttributeError: 'int' object has no attribute 'astimezone'`): Telegram sends the edit time as a unix timestamp. Edits were never stored before this fix.
+- The channel gets only the program, in the owner's format, ready to copy and fill in; the reasons and the warm-up stay in `/plan`. No `#план` mark: a copy of the plan is the owner's workout.
+- A workout post is treated as being written during the session: ✍ while it is edited, and the report (KPD, records, unreadable lines, name questions, reached goals) comes after 40 quiet minutes (`log_settle`, 0 = at once). Later corrections refresh the reaction and mention only new unreadable lines.
+
 ## 1.2.0 - 2026-10-27
 
 Goals with a forecast, and the fixes from an adversarial review.
@@ -19,7 +25,7 @@ Goals with a forecast, and the fixes from an adversarial review.
 ### Fixed: parsing
 - `80x5` became 80 sets; `3xмакс 12,10,8` became 12,1 kg; `60/62,5/65кг`, `60кг, 62,5кг, 65кг` and `8,8,7` lost per-set values; ordinal stems inside words («пятках», «опять», «повторил») added phantom sets; «30кг третий» was ignored; «минимум» read as minutes; «20 максимум повторов» read as 20 kg.
 - Auto-merge joined different exercises (стоя/сидя, 30°/45°, bracket variants like «акцент на трицепс»). Only a typo inside one word merges silently now; dumbbell aliases merged into a barbell lift are split off by a migration.
-- The bot's own plan posts are marked `#план` and never parsed as workouts; a bare weekday note no longer takes a day of the cycle; body weight inside a workout post and «вчера» for body posts are kept; a template with starting weights is a template; a superset part with its own scheme no longer borrows its partner's weight; typo exercises disappear after the post is edited.
+- The bot's own plan posts are never parsed as workouts; a bare weekday note no longer takes a day of the cycle; body weight inside a workout post and «вчера» for body posts are kept; a template with starting weights is a template; a superset part with its own scheme no longer borrows its partner's weight; typo exercises disappear after the post is edited.
 
 ### Fixed: running unattended
 - An empty heartbeat file after a power loss crash-looped the bot; the heartbeat is atomic and only written while polling works, and a watchdog restarts a bot that has stopped receiving updates.

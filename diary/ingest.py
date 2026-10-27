@@ -88,7 +88,16 @@ def resolve(db: Db, raw_name: str, known: dict[str, int] | None = None) -> Resol
     return res
 
 
-def ingest_post(db: Db, message_id: int, when: datetime, text: str, edited: datetime | None = None) -> IngestResult:
+def _moment(value: datetime | float | int | None) -> datetime | None:
+    """Telegram gives the edit time as a unix timestamp and the post time as a datetime."""
+    if value is None or isinstance(value, datetime):
+        return value
+    return datetime.fromtimestamp(value, timezone.utc)
+
+
+def ingest_post(db: Db, message_id: int, when: datetime | int, text: str,
+                edited: datetime | int | None = None) -> IngestResult:
+    when, edited = _moment(when), _moment(edited)
     parsed = parse_post(text)
     day = local_day(when)
     if when.tzinfo is None:
@@ -305,7 +314,7 @@ def import_export(db: Db, path: str | Path, activate_latest: bool = True) -> Imp
     unparsed: list[tuple[int, str]] = []
     for ep in posts:
         if db.is_sent(ep.message_id):
-            continue  # the bot's own plans; on a fresh database parse_post spots them by BOT_MARK
+            continue  # the bot's own plans
         r = ingest_post(db, ep.message_id, ep.when, ep.text)
         kinds[r.kind] = kinds.get(r.kind, 0) + 1
         sets += r.sets

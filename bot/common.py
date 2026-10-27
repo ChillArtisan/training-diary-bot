@@ -14,8 +14,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from diary import aliases, clock, state
 from diary.db import Db
-from diary.parse import BOT_MARK
-from diary.today import build_plan, render_html
+from diary.today import build_plan, render_post
 
 from .config import Config
 
@@ -184,8 +183,8 @@ async def post_plan(bot: Bot, db: Db, ident: Identity, mode: str = "normal") -> 
     if plan is None:
         return False
     state.note_plan(db, now.date(), plan)
-    for part in chunks(render_html(plan) + "\n" + BOT_MARK):
-        sent = await bot.send_message(ident.channel_id, part)
+    for part in chunks(render_post(plan)):  # no reasons or warm-up: those are in /plan
+        sent = await bot.send_message(ident.channel_id, part, parse_mode=None)
         db.mark_sent(sent.message_id, now.date().isoformat())
     return True
 
