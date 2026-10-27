@@ -9,7 +9,7 @@ import html
 import re
 from dataclasses import dataclass, field
 
-PARSER_VERSION = 3  # bump on any grammar change: stored posts are re-parsed on startup
+PARSER_VERSION = 4  # bump on any grammar change: stored posts are re-parsed on startup
 
 NUM = r"\d+(?:[.,]\d+)?"
 
