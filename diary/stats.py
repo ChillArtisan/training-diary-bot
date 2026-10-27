@@ -5,6 +5,7 @@ import html
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+from . import state
 from .db import Db
 from .recommend import fmt_num, fmt_weight
 
@@ -59,7 +60,7 @@ def post_records(db: Db, post_id: int) -> list[Record]:
     out = []
     for eid, rows in by_ex.items():
         now = _best(rows, bw)
-        before = _best(db.sets_before(eid, post["date_utc"]), bw)
+        before = _best(db.sets_before(eid, post["date_utc"], rows[0]["day"]), bw)
         if now and before and now[0] > before[0] + 0.25:
             r = now[1]
             out.append(Record(db.exercise(eid)["name"], r["weight"], r["reps"], r["weight_kind"], now[0], before[0]))
@@ -132,14 +133,19 @@ def training_days(db: Db, first: date, last: date) -> int:
 
 
 def streak(db: Db, today: date) -> int:
-    """Weeks in a row (ending with the current or last week) with enough training days."""
+    """Weeks in a row (ending with the current or last week) with enough training days; paused weeks are skipped."""
     need = max(1, planned_per_week(db) - 1)
+    paused = state.paused_weeks(db, today)
+
+    def ok(w: date) -> bool:
+        return training_days(db, w, w + timedelta(days=6)) >= need
+
     start, _ = week_bounds(today)
-    if training_days(db, start, start + timedelta(days=6)) < need:
+    if start not in paused and not ok(start):
         start -= timedelta(days=7)  # the current week may still be in progress
     n = 0
-    while training_days(db, start, start + timedelta(days=6)) >= need:
-        n += 1
+    while start in paused or ok(start):
+        n += start not in paused
         start -= timedelta(days=7)
     return n
 

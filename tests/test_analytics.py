@@ -77,7 +77,7 @@ def test_consistency_and_return_after_break(db):
 def test_volume_by_muscle(db):
     week1(db, 2, 4)
     vol = analytics.weekly_volume(db, date(2026, 10, 10), by="muscle")
-    assert vol == {"грудь": 1.0, "спина": 1.0}
+    assert vol == {"грудь": 4.0, "спина": 4.0}  # one week of data, not averaged over four
 
 
 def test_main_lifts_and_strength_points(db):

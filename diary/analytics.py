@@ -8,9 +8,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from . import movement, stats
+from . import movement, state, stats
 from .db import Db
-from .recommend import fmt_num
+from .recommend import fmt_num, is_deload
 
 # KPD = weighted mean of the parts that can be measured for a session
 W_COMPLETION, W_HIT, W_PROGRESS = 0.4, 0.4, 0.2
@@ -46,9 +46,14 @@ class Kpd:
     same: int = 0
     down: int = 0
     deload: bool = False
+    light: bool = False          # the bot offered a light day: judged on completion, not progress
+    planned_sets: int | None = None   # from the remembered plan, when there is one
+    done_sets: int = 0
 
     @property
     def completion(self) -> float | None:
+        if self.planned_sets:
+            return self.done_sets / self.planned_sets
         return self.done / self.planned if self.planned else None
 
     @property
@@ -58,7 +63,7 @@ class Kpd:
     @property
     def progress(self) -> float | None:
         n = self.up + self.same + self.down
-        if self.deload or not n:
+        if self.deload or self.light or not n:
             return None
         return (self.up + 0.5 * self.same) / n
 
@@ -82,19 +87,47 @@ class Kpd:
             bits.append(f"прибавил в {self.up} из {self.up + self.same + self.down}")
         elif self.deload:
             bits.append("разгрузка — прогресс не оцениваю")
+        elif self.light:
+            bits.append("лёгкий день — прогресс не оцениваю")
         return f"КПД {round(self.score)}% · " + " · ".join(bits)
 
 
-def _metric(rows, bw) -> tuple[str, float] | None:
-    """Comparable result of one exercise in one session: best e1RM, else best reps or seconds."""
-    best = max((e for r in rows if (e := stats.set_e1rm(r["weight"], r["reps"], r["weight_kind"], bw))), default=None)
-    if best:
-        return "e1rm", best
+def _best_set(rows, bw) -> dict | None:
+    """Best set of one exercise in one session: a weighted set, else the longest hold, else the most reps."""
+    weighted = []
+    for r in rows:
+        w, reps = r["weight"], r["reps"]
+        if w and reps:
+            if r["weight_kind"] == "added":
+                w += bw or 0
+            weighted.append((w * (1 + reps / 30), r["weight_kind"], w, reps))  # uncapped Epley, only for ranking
+    if weighted:
+        e, kind, w, reps = max(weighted)
+        return {"kind": kind, "e": e, "w": w, "reps": reps}
     secs = max((r["seconds"] or 0 for r in rows), default=0)
     if secs:
-        return "sec", secs
+        return {"kind": "sec", "value": secs}
     reps = max((r["reps"] or 0 for r in rows if r["weight"] is None), default=0)
-    return ("reps", reps) if reps else None
+    return {"kind": "reps", "value": reps} if reps else None
+
+
+def _sign(ratio: float) -> int:
+    change = ratio - 1
+    return 1 if change > SAME_BAND else -1 if change < -SAME_BAND else 0
+
+
+def _compare(cur: dict, prev: dict) -> int | None:
+    """1 = better, 0 = held, -1 = worse. Weight up with reps held (within 2) is progress at any rep count."""
+    if cur["kind"] != prev["kind"]:
+        return None
+    if "value" in cur:
+        return _sign(cur["value"] / prev["value"])
+    heavier = _sign(cur["w"] / prev["w"])
+    if heavier > 0 and cur["reps"] >= prev["reps"] - 2:
+        return 1
+    if heavier == 0 and cur["reps"] != prev["reps"]:
+        return 1 if cur["reps"] > prev["reps"] else -1
+    return _sign(cur["e"] / prev["e"])
 
 
 def kpd_series(db: Db) -> list[Kpd]:
@@ -107,8 +140,8 @@ def kpd_series(db: Db) -> list[Kpd]:
     for r in db.all_sets():
         sets_by_session[r["session_id"]].append(r)
 
-    last_any: dict[int, tuple[str, float]] = {}             # exercise -> last result
-    last_same_day: dict[tuple[int, int, int], tuple[str, float]] = {}  # (program, ord, exercise) -> result
+    last_any: dict[int, dict] = {}             # exercise -> last result
+    last_same_day: dict[tuple[int, int, int], dict] = {}  # (program, ord, exercise) -> result
     out = []
     for s in db.sessions_chrono():
         rows = sets_by_session.get(s["id"], [])
@@ -116,14 +149,24 @@ def kpd_series(db: Db) -> list[Kpd]:
             continue
         k = Kpd(s["id"], date.fromisoformat(s["day"]), s["title"] or "")
         plan = items.get((s["program_id"], s["ord"])) if s["ord"] is not None else None
-        k.deload = (s["rir"] or 0) >= 4 or "разгруз" in (s["phase"] or "").lower()
+        k.deload = is_deload(s["rir"], s["phase"])
         by_ex: dict[int, list] = defaultdict(list)
         for r in rows:
             by_ex[r["exercise_id"]].append(r)
+        note = state.plan_note(db, s["day"])
+        if note and plan and note.get("day_id") != plan[0]["day_id"]:
+            note = None  # the plan shown was for another day than the one trained
+        if note and note.get("items"):
+            wanted = {int(eid): int(n or 1) for eid, n in note["items"]}
+            k.planned, k.done = len(wanted), len(wanted.keys() & by_ex.keys())
+            k.planned_sets = sum(wanted.values())
+            k.done_sets = sum(min(len(by_ex.get(eid, [])), n) for eid, n in wanted.items())
+            k.light = note.get("mode") == "light"
         if plan:
             planned = {it["exercise_id"]: it for it in plan}
-            k.planned, k.done = len(planned), len(planned.keys() & by_ex.keys())
-            k.deload = k.deload or (plan[0]["day_rir"] or 0) >= 4 or "разгруз" in (plan[0]["phase"] or "").lower()
+            if not k.planned:
+                k.planned, k.done = len(planned), len(planned.keys() & by_ex.keys())
+            k.deload = k.deload or is_deload(plan[0]["day_rir"], plan[0]["phase"])
             for eid, ex_rows in by_ex.items():
                 it = planned.get(eid)
                 if not it or it["reps_min"] is None:
@@ -134,20 +177,17 @@ def kpd_series(db: Db) -> list[Kpd]:
                         k.graded += 1
                         k.hit += value >= it["reps_min"]
         for eid, ex_rows in by_ex.items():
-            m = _metric(ex_rows, bw)
+            m = _best_set(ex_rows, bw)
             if m is None:
                 continue
             key = (s["program_id"], s["ord"], eid) if s["ord"] is not None else None
             prev = last_same_day.get(key) if key else None
             prev = prev or last_any.get(eid)
-            if prev and prev[0] == m[0] and prev[1]:
-                change = m[1] / prev[1] - 1
-                if change > SAME_BAND:
-                    k.up += 1
-                elif change < -SAME_BAND:
-                    k.down += 1
-                else:
-                    k.same += 1
+            verdict = _compare(m, prev) if prev else None
+            if verdict is not None:
+                k.up += verdict > 0
+                k.same += verdict == 0
+                k.down += verdict < 0
             last_any[eid] = m
             if key:
                 last_same_day[key] = m
@@ -180,6 +220,7 @@ class Consistency:
     weekday_share: dict[int, tuple[int, int]] = field(default_factory=dict)  # program weekday -> (weeks hit, weeks)
     training_days: set[date] = field(default_factory=set)
     since_return: tuple[date, float, int] | None = None     # after a long break: (first day back, adherence, weeks)
+    paused: set[date] = field(default_factory=set)          # mondays of weeks mostly spent on /pause
 
 
 def consistency(db: Db, today: date, weeks: int = 12) -> Consistency:
@@ -189,16 +230,20 @@ def consistency(db: Db, today: date, weeks: int = 12) -> Consistency:
     first = week_start(min(days)) if days else this_week
     window = [this_week - timedelta(weeks=i) for i in range(weeks, 0, -1)]
     window = [w for w in window if w >= first]
+    paused = state.paused_weeks(db, today)
     per_week = [(w, sum(1 for d in days if w <= d < w + timedelta(days=7))) for w in window]
-    adherence = (sum(min(n, planned) for _, n in per_week) / (planned * len(per_week))) if per_week else None
-    avg = sum(n for _, n in per_week) / len(per_week) if per_week else 0.0
+    active = [(w, n) for w, n in per_week if w not in paused]  # paused weeks are not misses
+    adherence = (sum(min(n, planned) for _, n in active) / (planned * len(active))) if active else None
+    avg = sum(n for _, n in active) / len(active) if active else 0.0
 
     # streaks over the whole history (a week counts with at least planned - 1 training days)
     need = max(1, planned - 1)
     best = cur = 0
     w = first
     while w < this_week:
-        if sum(1 for d in days if w <= d < w + timedelta(days=7)) >= need:
+        if w in paused:
+            pass  # neither counts nor breaks the streak
+        elif sum(1 for d in days if w <= d < w + timedelta(days=7)) >= need:
             cur += 1
             best = max(best, cur)
         else:
@@ -213,9 +258,9 @@ def consistency(db: Db, today: date, weeks: int = 12) -> Consistency:
     since_return = None
     ordered = sorted(days)
     back = [b for a, b in zip(ordered, ordered[1:]) if (b - a).days > RETURN_GAP_DAYS]
-    share_window = window
+    share_window = [w for w in window if w not in paused]
     if back and window and back[-1] > window[0]:
-        weeks_back = [(w, n) for w, n in per_week if w >= week_start(back[-1])]
+        weeks_back = [(w, n) for w, n in active if w >= week_start(back[-1])]
         if weeks_back:
             since_return = (back[-1], sum(min(n, planned) for _, n in weeks_back) / (planned * len(weeks_back)),
                             len(weeks_back))
@@ -228,20 +273,31 @@ def consistency(db: Db, today: date, weeks: int = 12) -> Consistency:
             weekday_share[wd] = (hit, len(share_window))
     return Consistency(per_week, planned, adherence, avg, current, max(best, current),
                        (today - max(days)).days if days else None, max(gaps, default=0), weekday_share, days,
-                       since_return)
+                       since_return, paused & set(window))
 
 
 # ---------- volume and strength trends ----------
 
+def data_weeks(db: Db, today: date, days: int = 28) -> float:
+    """Weeks of data in the last `days`: from the first set in the window to today, at least 1."""
+    first = (today - timedelta(days=days - 1)).isoformat()
+    start = min((r["day"] for r in db.all_sets() if r["day"] >= first), default=None)
+    if start is None:
+        return days / 7
+    span = (today - date.fromisoformat(start)).days + 1
+    return max(1.0, min(span, days) / 7)
+
+
 def weekly_volume(db: Db, today: date, days: int = 28, by: str = "movement") -> dict[str, float]:
-    """Working sets per movement group (or per muscle group, by="muscle") per week over the last `days`."""
+    """Working sets per movement group (or per muscle group, by="muscle") per week over the last `days`.
+    With less history than `days` it divides by the weeks actually covered."""
     first = (today - timedelta(days=days - 1)).isoformat()
     counts: dict[str, int] = defaultdict(int)
     for r in db.all_sets():
         if r["day"] >= first:
             group = movement.group_of(r["exercise"]) or "прочее"
             counts[MUSCLES.get(group, "прочее") if by == "muscle" else group] += 1
-    weeks = days / 7
+    weeks = data_weeks(db, today, days)
     return {g: n / weeks for g, n in sorted(counts.items(), key=lambda x: -x[1])}
 
 
@@ -334,7 +390,7 @@ def insights(db: Db, today: date) -> list[str]:
     out = []
     c = consistency(db, today)
     if c.adherence is not None:
-        out.append(f"Постоянство за {len(c.weeks)} нед.: {_pct(c.adherence)} — в среднем "
+        out.append(f"Постоянство за {len(c.weeks) - len(c.paused)} нед.: {_pct(c.adherence)} — в среднем "
                    f"{fmt_num(round(c.avg_per_week, 1))} тренировки в неделю из {c.planned}.")
     if c.since_return:
         day, adh, n = c.since_return
@@ -373,7 +429,7 @@ def insights(db: Db, today: date) -> list[str]:
         more, less = ("жимов", "тяг") if push > pull else ("тяг", "жимов")
         out.append(f"Перекос: {more} {fmt_num(round(max(push, pull)))} подх./нед. против "
                    f"{fmt_num(round(min(push, pull)))} у {less}.")
-    muscles = weekly_volume(db, today, by="muscle")
+    muscles = weekly_volume(db, today, by="muscle") if data_weeks(db, today) >= 2 else {}
     low = [m for m, v in muscles.items() if v < VOLUME_ZONE[0] and m not in ("пресс", "прочее")]
     if low and len(low) <= 4:
         out.append(f"Меньше {VOLUME_ZONE[0]} подходов в неделю: {', '.join(low)} — для роста мышц маловато.")

@@ -5,6 +5,7 @@ Uses matplotlib's object API (no pyplot), so charts can be rendered in a worker 
 from __future__ import annotations
 
 import io
+import math
 from datetime import date, timedelta
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -49,12 +50,17 @@ def _png(fig: Figure) -> bytes:
     return buf.getvalue()
 
 
+def _finite(v) -> bool:
+    return v is not None and math.isfinite(v)
+
+
 def _num(v: float) -> str:
     return f"{v:.1f}".rstrip("0").rstrip(".").replace(".", ",")
 
 
-def strength(name: str, points: list[tuple[date, float, float | None]]) -> bytes | None:
-    """points: (day, estimated 1RM, top working weight)."""
+def strength(name: str, points: list[tuple[date, float, float | None]], goal: float | None = None,
+             projection: list[tuple[date, float]] | None = None) -> bytes | None:
+    """points: (day, estimated 1RM, top working weight); goal: the target 1RM; projection: the trend to it."""
     if len(points) < 2:
         return None
     fig, ax = _figure()
@@ -74,6 +80,11 @@ def strength(name: str, points: list[tuple[date, float, float | None]]) -> bytes
         ax.scatter([d for d, _ in prs], [e for _, e in prs], marker="*", s=90, color=WARN, zorder=5, label="рекорд")
     ax.annotate(f"{_num(e1[-1])} кг", (days[-1], e1[-1]), xytext=(6, 0), textcoords="offset points",
                 fontsize=9, color=ACCENT, va="center")
+    if goal:
+        ax.axhline(goal, color=WARN, linewidth=1, linestyle=":", label=f"цель {_num(goal)} кг")
+    if projection and len(projection) >= 2:
+        ax.plot([d for d, _ in projection], [v for _, v in projection], color=ACCENT, linewidth=1.2,
+                linestyle="--", alpha=0.6, label="прогноз по темпу")
     ax.xaxis.set_major_formatter(DateFormatter("%d.%m.%y"))
     ax.set_ylabel("кг", color=MUTED, fontsize=9)
     ax.legend(frameon=False, fontsize=8, loc="lower right")
@@ -85,9 +96,10 @@ def strength(name: str, points: list[tuple[date, float, float | None]]) -> bytes
 
 
 def consistency(training_days: set[date], planned_weekdays: set[int], today: date, weeks: int = 26,
-                subtitle: str = "", plan_from: date | None = None) -> bytes:
+                subtitle: str = "", plan_from: date | None = None, paused: set[date] | None = None) -> bytes:
     """GitHub-style calendar: a column per week, a row per weekday. Missed plan days are red only
-    from `plan_from` (when the current program started): older weeks had other programs."""
+    from `plan_from` (when the current program started): older weeks had other programs.
+    `paused`: mondays of weeks spent on /pause, shown grey instead of red."""
     fig, ax = _figure(8, 3)
     ax.grid(False)
     for side in ("left", "bottom"):
@@ -103,8 +115,11 @@ def consistency(training_days: set[date], planned_weekdays: set[int], today: dat
                 color = GOOD
                 trained += 1
             elif row in planned_weekdays and (plan_from is None or d >= plan_from) and d < today:
-                color = "#ffd8d3"
-                missed += 1
+                if paused and d - timedelta(days=row) in paused:
+                    color = "#d0d7de"
+                else:
+                    color = "#ffd8d3"
+                    missed += 1
             else:
                 color = LIGHT
             ax.add_patch(_square(col, 6 - row, color))
@@ -130,8 +145,10 @@ def _square(x: float, y: float, color: str):
 
 def weekly(weeks: list[tuple[date, int, float]], planned: int) -> bytes | None:
     """weeks: (monday, training days, tonnage in tonnes)."""
+    weeks = [(w, n, t if _finite(t) else 0.0) for w, n, t in weeks if _finite(n)]
     if not weeks:
         return None
+    planned = planned if _finite(planned) else 0
     fig, ax = _figure()
     xs = list(range(len(weeks)))
     colors = [GOOD if n >= planned else WARN if n >= planned - 1 and n else LIGHT for _, n, _ in weeks]
@@ -156,6 +173,7 @@ def weekly(weeks: list[tuple[date, int, float]], planned: int) -> bytes | None:
 
 
 def kpd(points: list[tuple[date, float]]) -> bytes | None:
+    points = [p for p in points if _finite(p[1])]
     if len(points) < 2:
         return None
     fig, ax = _figure()
@@ -176,9 +194,9 @@ def kpd(points: list[tuple[date, float]]) -> bytes | None:
 
 
 def volume(sets_per_week: dict[str, float], zone: tuple[int, int] = (10, 20)) -> bytes | None:
-    if not sets_per_week:
+    items = sorted(((g, v) for g, v in sets_per_week.items() if _finite(v)), key=lambda x: x[1])
+    if not items:
         return None
-    items = sorted(sets_per_week.items(), key=lambda x: x[1])
     fig, ax = _figure(8, max(3, 0.32 * len(items) + 1))
     ax.grid(axis="y", visible=False)
     ax.grid(axis="x", color=LIGHT, linewidth=0.8)
@@ -195,6 +213,7 @@ def volume(sets_per_week: dict[str, float], zone: tuple[int, int] = (10, 20)) ->
 
 
 def bodyweight(points: list[tuple[date, float]]) -> bytes | None:
+    points = [p for p in points if _finite(p[1])]
     if len(points) < 2:
         return None
     fig, ax = _figure()
