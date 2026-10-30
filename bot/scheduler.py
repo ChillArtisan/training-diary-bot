@@ -75,7 +75,8 @@ async def run_morning(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
 async def run_nudge(bot: Bot, db: Db, ident: Identity, now: datetime) -> None:
     day = program.next_day(db)
     if day:
-        await dm(bot, ident, f"Сегодня по плану «{html.escape(day['title'])}». Если был в зале — запиши в канал. "
+        await dm(bot, ident, f"Сегодня по плану «{html.escape(day['title'])}». Если был в зале — запиши в канал "
+                             "(заполнил программу прямо в посте — нажми под ней «✅ Записать тренировку»). "
                              "Если нет — ничего, день подождёт.", strict=True,
                  reply_markup=kb([("Пропустить этот день", "skipday"), ("Сделаю позже", "later")]))
 

@@ -111,10 +111,11 @@ CREATE TABLE IF NOT EXISTS measurement (
     PRIMARY KEY (post_id, key)
 );
 
--- posts the bot itself published into the channel; never parsed as logs
+-- plans the bot published into the channel: not a workout as posted, the owner's workout once edited
 CREATE TABLE IF NOT EXISTS sent_post (
     message_id  INTEGER PRIMARY KEY,
-    day         TEXT NOT NULL
+    day         TEXT NOT NULL,
+    text        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS goal (

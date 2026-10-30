@@ -34,11 +34,18 @@ def _split_equipment_aliases(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM settings WHERE key = 'parser_version'")  # re-read the posts with the new aliases
 
 
+def _sent_post_text(conn: sqlite3.Connection) -> None:
+    """Keep the text of each plan the bot posts, to tell the plan as posted from the owner's filled-in copy."""
+    if "text" not in {r[1] for r in conn.execute("PRAGMA table_info(sent_post)")}:
+        conn.execute("ALTER TABLE sent_post ADD COLUMN text TEXT")
+
+
 # Changes to tables that already exist: SQL scripts or functions of the connection. schema.sql only
 # creates what is missing, so a new column or an index on a new column goes here. Append only;
 # each step runs in one transaction together with its user_version bump.
 MIGRATIONS: list[str | Callable[[sqlite3.Connection], None]] = [
     _split_equipment_aliases,
+    _sent_post_text,
 ]
 
 
@@ -475,9 +482,21 @@ class Db:
         return float(v) if v else None
 
     # posts made by the bot
-    def mark_sent(self, message_id: int, day: str) -> None:
-        self.conn.execute("INSERT OR IGNORE INTO sent_post(message_id, day) VALUES(?, ?)", (message_id, day))
+    def mark_sent(self, message_id: int, day: str, text: str | None = None) -> None:
+        self.conn.execute("INSERT OR IGNORE INTO sent_post(message_id, day, text) VALUES(?, ?, ?)",
+                          (message_id, day, text))
         self.conn.commit()
+
+    def sent_text(self, message_id: int) -> str | None:
+        """The text the bot posted ('' for plans posted before 1.2.2); None for posts that are not the bot's."""
+        row = self.one("SELECT coalesce(text, '') AS text FROM sent_post WHERE message_id = ?", message_id)
+        return row["text"] if row else None
 
     def is_sent(self, message_id: int) -> bool:
         return self.one("SELECT 1 FROM sent_post WHERE message_id = ?", message_id) is not None
+
+    def unrecorded_plans(self, day: str) -> list[int]:
+        """The bot's plan posts of a day that the owner has not turned into a workout yet."""
+        return [r[0] for r in self.conn.execute(
+            "SELECT s.message_id FROM sent_post s LEFT JOIN post p ON p.message_id = s.message_id "
+            "WHERE s.day = ? AND p.message_id IS NULL", (day,))]

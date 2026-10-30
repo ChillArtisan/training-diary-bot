@@ -80,7 +80,8 @@ a Sunday summary (sessions, tonnage, records, streak, body weight), a gentle not
 🔥 reactions on personal records. The channel gets only the program, ready to copy and fill in during the session
 (the reasons for each weight are in `/plan`). A workout post can be edited set by set: it shows ✍ while it changes,
 and the report (KPD, records, lines it could not read) comes once the post has been quiet for 40 minutes
-(`/set log_settle`).
+(`/set log_settle`). The plan post itself can be filled in too: Telegram does not tell a bot about edits to its own
+posts, so the post carries a «✅ Записать тренировку» button that reads it on tap (forwarding it to the bot works too).
 
 **Shows progress.** A persistent keyboard in the private chat (📋 План · 😵 Лёгкий · ⏱ Коротко · 🔁 Замена ·
 📈 Прогресс · 📊 Аналитика · ⏸ Пауза) and charts rendered with matplotlib:

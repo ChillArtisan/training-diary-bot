@@ -95,6 +95,13 @@ def _moment(value: datetime | float | int | None) -> datetime | None:
     return datetime.fromtimestamp(value, timezone.utc)
 
 
+def untouched_plan(db: Db, message_id: int, text: str) -> bool:
+    """The bot's plan exactly as the bot posted it. The owner fills the plan in during the session,
+    and from the first edit that post is their workout."""
+    posted = db.sent_text(message_id)
+    return posted is not None and posted.split() == text.split()
+
+
 def ingest_post(db: Db, message_id: int, when: datetime | int, text: str,
                 edited: datetime | int | None = None) -> IngestResult:
     when, edited = _moment(when), _moment(edited)
@@ -313,8 +320,9 @@ def import_export(db: Db, path: str | Path, activate_latest: bool = True) -> Imp
     sets = lines = new = sugg = 0
     unparsed: list[tuple[int, str]] = []
     for ep in posts:
-        if db.is_sent(ep.message_id):
-            continue  # the bot's own plans
+        posted = db.sent_text(ep.message_id)
+        if posted is not None and (not posted or posted.split() == ep.text.split()):
+            continue  # the bot's own plans, unless the owner filled one in
         r = ingest_post(db, ep.message_id, ep.when, ep.text)
         kinds[r.kind] = kinds.get(r.kind, 0) + 1
         sets += r.sets

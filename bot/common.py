@@ -175,6 +175,15 @@ async def dm(bot: Bot, ident: Identity, text: str, strict: bool = False, **kw) -
         return False
 
 
+# Telegram never tells a bot that a person edited the bot's own post, so a plan filled in right in the
+# channel is read when the owner taps this button (or forwards the post to the bot).
+PLAN_DONE = "plan:done"
+
+
+def plan_markup(recorded: bool = False) -> InlineKeyboardMarkup:
+    return kb([("🔄 Обновить запись" if recorded else "✅ Записать тренировку", PLAN_DONE)])
+
+
 async def post_plan(bot: Bot, db: Db, ident: Identity, mode: str = "normal") -> bool:
     if not ident.channel_id:
         return False
@@ -184,8 +193,8 @@ async def post_plan(bot: Bot, db: Db, ident: Identity, mode: str = "normal") -> 
         return False
     state.note_plan(db, now.date(), plan)
     for part in chunks(render_post(plan)):  # no reasons or warm-up: those are in /plan
-        sent = await bot.send_message(ident.channel_id, part, parse_mode=None)
-        db.mark_sent(sent.message_id, now.date().isoformat())
+        sent = await bot.send_message(ident.channel_id, part, parse_mode=None, reply_markup=plan_markup())
+        db.mark_sent(sent.message_id, now.date().isoformat(), part)
     return True
 
 

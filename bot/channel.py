@@ -5,16 +5,16 @@ import html
 import logging
 from datetime import datetime, timedelta
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import ChatMemberUpdated, Message, ReactionTypeEmoji
+from aiogram.types import CallbackQuery, ChatMemberUpdated, Message, ReactionTypeEmoji
 
 from diary import analytics, clock, goals, stats
 from diary.db import Db
-from diary.ingest import IngestResult, ingest_post
+from diary.ingest import IngestResult, ingest_post, untouched_plan
 
 from . import prefs
-from .common import Identity, dm, kb, send_suggestion
+from .common import PLAN_DONE, Identity, dm, kb, plan_markup, send_suggestion
 
 log = logging.getLogger(__name__)
 LOST = ("left", "kicked", "member", "restricted")
@@ -73,7 +73,7 @@ async def react(bot: Bot, chat_id: int | None, message_id: int, emoji: str | Non
         log.warning("reaction failed: %s", e)
 
 
-# A workout is posted at the start (often a copy of the plan) and edited set by set, so its report
+# A workout is posted at the start (a copy of the plan, or the bot's plan post itself) and edited set by set, so its report
 # (KPD, records, unreadable lines, name questions) waits until the post has been quiet for `log_settle` minutes.
 LIVE_KEY = "live_posts"
 KEEP_DONE = timedelta(days=3)
@@ -89,7 +89,8 @@ def forget_workout(db: Db, message_id: int) -> None:
         db.set_json(LIVE_KEY, posts)
 
 
-async def track_workout(bot: Bot, db: Db, ident: Identity, res: IngestResult) -> None:
+async def track_workout(bot: Bot, db: Db, ident: Identity, res: IngestResult, finished: bool = False) -> None:
+    """`finished`: the owner said the workout is over (the button under the plan post), so no waiting."""
     posts = db.get_json(LIVE_KEY, {})
     entry = posts.setdefault(str(res.message_id), {})
     entry["at"] = clock.now().isoformat()
@@ -107,24 +108,28 @@ async def track_workout(bot: Bot, db: Db, ident: Identity, res: IngestResult) ->
             db.set_json(LIVE_KEY, posts)
             await report(bot, db, ident, IngestResult(res.message_id, "log", unparsed=fresh), live=False)
         return
-    await react(bot, ident.channel_id, res.message_id, "✍")  # in progress
-    if settle_minutes(db) == 0:
-        await settle_workouts(bot, db, ident)
+    if finished or settle_minutes(db) == 0:
+        await settle_workouts(bot, db, ident, only=res.message_id)
+    else:
+        await react(bot, ident.channel_id, res.message_id, "✍")  # in progress
 
 
-async def settle_workouts(bot: Bot, db: Db, ident: Identity, now: datetime | None = None) -> int:
-    """Report the workouts nobody has edited for a while. Called by the scheduler."""
+async def settle_workouts(bot: Bot, db: Db, ident: Identity, now: datetime | None = None,
+                          only: int | None = None) -> int:
+    """Report the workouts nobody has edited for a while (called by the scheduler), or `only` this one at once."""
     now = now or clock.now()
     wait = timedelta(minutes=settle_minutes(db))
     posts = db.get_json(LIVE_KEY, {})
     done = 0
     for key, entry in list(posts.items()):
+        if only is not None and key != str(only):
+            continue
         quiet = now - datetime.fromisoformat(entry["at"])
         if entry.get("done"):
             if quiet > KEEP_DONE:
                 del posts[key]
             continue
-        if quiet < wait:
+        if quiet < wait and only is None:
             continue
         mid = int(key)
         post = db.post(mid)
@@ -155,11 +160,9 @@ def build_channel_router(db: Db, ident: Identity) -> Router:
     router.edited_channel_post.filter(ours)
 
     async def process(message: Message, bot: Bot, edited: bool) -> None:
-        if db.is_sent(message.message_id):
-            return
         text = message.text or message.caption
-        if not text:
-            return
+        if not text or untouched_plan(db, message.message_id, text):
+            return  # the plan as the bot posted it; once the owner edits it, it is their workout
         res = ingest_post(db, message.message_id, message.date, text, message.edit_date if edited else None)
         if res.kind == "log" and res.sets:
             await track_workout(bot, db, ident, res)
@@ -176,6 +179,29 @@ def build_channel_router(db: Db, ident: Identity) -> Router:
     @router.edited_channel_post()
     async def on_edit(message: Message, bot: Bot) -> None:
         await process(message, bot, edited=True)
+
+    @router.callback_query(F.data == PLAN_DONE)
+    async def on_plan_done(cb: CallbackQuery, bot: Bot) -> None:
+        post = cb.message
+        if cb.from_user.id != ident.owner_id or not isinstance(post, Message) or post.chat.id != ident.channel_id:
+            await cb.answer()
+            return
+        text = post.text or post.caption or ""
+        if untouched_plan(db, post.message_id, text):
+            await cb.answer("Программа ещё без правок: впиши, что сделал, и нажми снова. "
+                            "Если уже правил — перешли этот пост мне.", show_alert=True)
+            return
+        res = ingest_post(db, post.message_id, post.date, text, post.edit_date or clock.now())
+        if res.kind != "log" or not res.sets:
+            await cb.answer("Не нашёл в посте ни одного подхода.", show_alert=True)
+            return
+        await cb.answer("Записал.")
+        await track_workout(bot, db, ident, res, finished=True)
+        try:
+            await bot.edit_message_reply_markup(chat_id=post.chat.id, message_id=post.message_id,
+                                                reply_markup=plan_markup(recorded=True))
+        except TelegramAPIError as e:
+            log.info("plan button not updated: %s", e)
 
     @router.my_chat_member()
     async def on_membership(update: ChatMemberUpdated, bot: Bot) -> None:

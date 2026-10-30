@@ -112,8 +112,10 @@ def test_settings_body_and_sent(db):
     assert db.bodyweight() is None
     ingest_post(db, 5, at(0), "70,6кг")
     assert db.bodyweight() == 70.6
-    db.mark_sent(99, "2026-10-27")
+    db.mark_sent(99, "2026-10-27", "Жим – 3x5 60кг")
     assert db.is_sent(99) and not db.is_sent(98)
+    assert db.sent_text(99) == "Жим – 3x5 60кг" and db.sent_text(98) is None
+    assert db.unrecorded_plans("2026-10-27") == [99] and db.unrecorded_plans("2026-10-28") == []
     assert db.post_counts() == {"body": 1}
     assert not db.has_session_on("2026-10-01")
 
@@ -190,3 +192,18 @@ def test_exercises_beat_a_wrong_weekday(db):
     program.activate(db, pid)
     ingest_post(db, 2, at(1), "ВТОРНИК\nЖим штанги лежа – 4x8 60кг\nТяга штанги в наклоне – 4x10 60кг")
     assert program.next_day(db)["title"] == "ВТОРНИК: НИЗ А"  # matched Monday by the exercises
+
+
+def test_old_sent_post_table_gets_the_text_column(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE sent_post (message_id INTEGER PRIMARY KEY, day TEXT NOT NULL)")
+    conn.execute("INSERT INTO sent_post VALUES (234, '2026-10-29')")
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+    db = Db(path)
+    assert db.sent_text(234) == ""  # posted before the text was kept: any edit is the owner's
+    db.mark_sent(236, "2026-10-30", "x")
+    assert db.sent_text(236) == "x"

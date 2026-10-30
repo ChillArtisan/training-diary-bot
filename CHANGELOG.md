@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.2 - 2026-10-30
+
+- The plan post can be filled in right in the channel. Telegram never sends a bot the edits a person makes to the bot's own post, so the plan was ignored however it was edited, and the owner had to repost it. The plan now carries a «✅ Записать тренировку» button: a tap reads the post as it is now and reports the workout at once; after that the button says «🔄 Обновить запись» for later corrections. Forwarding the filled-in plan to the bot works too, and so would an edit, if Telegram ever delivered one.
+- The bot keeps the text of each plan it posts (`sent_post.text`), so it can tell the plan as posted from a filled-in one. A plan posted earlier today gets the button when the bot starts.
+
 ## 1.2.1 - 2026-10-27
 
 - Fixed: editing a channel post failed (`AttributeError: 'int' object has no attribute 'astimezone'`): Telegram sends the edit time as a unix timestamp. Edits were never stored before this fix.

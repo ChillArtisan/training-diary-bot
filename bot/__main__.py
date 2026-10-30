@@ -10,12 +10,13 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, ErrorEvent
 
+from diary import clock
 from diary.db import Db
 from diary.ingest import reparse_if_needed
 
 from . import health, pending, ui
 from .channel import build_channel_router
-from .common import Alerts, Identity, dm
+from .common import Alerts, Identity, dm, plan_markup
 from .config import Config
 from .owner import build_claim_router, build_fallback_router, build_owner_router
 from .scheduler import scheduler_loop
@@ -67,6 +68,11 @@ async def startup(bot: Bot, db: Db, ident: Identity) -> None:
                 await dm(bot, ident, "⚠️ В канале у меня нет прав админа с публикацией — проверь настройки канала.")
         except TelegramAPIError as e:
             await dm(bot, ident, f"⚠️ Не вижу канал дневника: {html.escape(str(e))}")
+        for mid in db.unrecorded_plans(clock.today().isoformat()):  # a plan posted before the button existed
+            try:
+                await bot.edit_message_reply_markup(chat_id=ident.channel_id, message_id=mid, reply_markup=plan_markup())
+            except TelegramAPIError as e:
+                log.info("plan %s: button not added: %s", mid, e)
 
 
 async def main() -> None:

@@ -635,11 +635,20 @@ def test_plan_in_the_channel_is_only_the_program(env):
     from diary import clock, state
     from diary.parse import parse_post
     db, ident, alerts, bot = env
+    markups, send = [], bot.send_message
+
+    async def spy(chat_id, text, **kw):
+        markups.append(kw.get("reply_markup"))
+        return await send(chat_id, text, **kw)
+
+    bot.send_message = spy
     assert run(post_plan(bot, db, ident))
+    assert markups[-1].inline_keyboard[0][0].callback_data == "plan:done"
     last = bot.sent[-1][1]
     assert last.startswith("НЕДЕЛЯ 1") and "Почему" not in last and "•" not in last and "<" not in last
     assert parse_post(last).kind != "bot"  # the owner copies it and fills it in: that copy is a workout
     assert state.plan_note(db, clock.today()) is not None
+    assert db.one("SELECT text FROM sent_post ORDER BY message_id DESC")["text"] == last
 
 
 def test_status_shows_package_version():
@@ -694,3 +703,56 @@ def test_settle_zero_reports_at_once(tmp_path, monkeypatch):
     dp, bot, session = build(db, ident)
     feed(dp, bot, channel_post=channel_post("Жим штанги лежа – 4x8 60кг"))
     assert reactions(session)[-1] == (500, "👍")
+
+
+PLAN = "НЕДЕЛЯ 1: ВВОД · RIR 3 · ~70-75% ПМ\nЧЕТВЕРГ: ВЕРХ Б\n\nЖим штанги лежа – 4x8 60кг"
+
+
+def test_the_plan_post_filled_in_place_is_the_workout(tmp_path, monkeypatch):
+    from bot.channel import LIVE_KEY
+    db, ident = make_ident(tmp_path, monkeypatch, owner=7, channel=CHANNEL)
+    db.mark_sent(500, "2026-10-27", PLAN)
+    dp, bot, session = build(db, ident)
+    feed(dp, bot, edited_channel_post=channel_post(PLAN + "\n", edit_date=int(NOW.timestamp()) + 60))
+    assert db.post(500) is None and reactions(session) == []  # same text: still the bot's plan
+    filled = PLAN.replace("60кг", "62,5кг")
+    feed(dp, bot, edited_channel_post=channel_post(filled, edit_date=int(NOW.timestamp()) + 600))
+    assert db.post(500)["kind"] == "log" and {r["weight"] for r in db.post_sets(500)} == {62.5}
+    assert reactions(session) == [(500, "✍")] and "500" in db.get_json(LIVE_KEY)
+
+
+def test_a_plan_posted_before_its_text_was_kept_counts_once_edited(tmp_path, monkeypatch):
+    db, ident = make_ident(tmp_path, monkeypatch, owner=7, channel=CHANNEL)
+    db.mark_sent(501, "2026-10-27")
+    dp, bot, session = build(db, ident)
+    feed(dp, bot, edited_channel_post=channel_post(PLAN, mid=501, edit_date=int(NOW.timestamp()) + 60))
+    assert {r["weight"] for r in db.post_sets(501)} == {60}
+
+
+def plan_tap(text, uid=7, edit_date=None):
+    return CallbackQuery(id="2", from_user=user(uid), chat_instance="c", data="plan:done",
+                         message=channel_post(text, edit_date=edit_date))
+
+
+def answers(session):
+    from aiogram.methods import AnswerCallbackQuery
+    return [c.text for c in session.of(AnswerCallbackQuery)]
+
+
+def test_the_button_under_the_plan_records_it_as_filled_in(tmp_path, monkeypatch):
+    # Telegram does not send the bot edits of its own post, so the button is how a plan filled in place is read
+    from aiogram.methods import EditMessageReplyMarkup
+    from bot.channel import LIVE_KEY
+    db, ident = make_ident(tmp_path, monkeypatch, owner=7, channel=CHANNEL)
+    db.mark_sent(500, "2026-10-27", PLAN)
+    dp, bot, session = build(db, ident)
+    feed(dp, bot, callback_query=plan_tap(PLAN))
+    assert db.post(500) is None and "без правок" in answers(session)[-1]
+    feed(dp, bot, callback_query=plan_tap(PLAN.replace("60кг", "62,5кг"), uid=8))  # not the owner
+    assert db.post(500) is None
+    feed(dp, bot, callback_query=plan_tap(PLAN.replace("60кг", "62,5кг"), edit_date=int(NOW.timestamp()) + 3600))
+    assert {r["weight"] for r in db.post_sets(500)} == {62.5} and answers(session)[-1] == "Записал."
+    assert db.get_json(LIVE_KEY)["500"]["done"] and reactions(session)[-1][1] != "✍"  # reported at once
+    assert session.of(EditMessageReplyMarkup)[-1].reply_markup.inline_keyboard[0][0].text == "🔄 Обновить запись"
+    feed(dp, bot, callback_query=plan_tap(PLAN.replace("60кг", "65кг")))  # corrected later
+    assert {r["weight"] for r in db.post_sets(500)} == {65}

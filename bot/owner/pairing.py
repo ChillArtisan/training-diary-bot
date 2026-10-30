@@ -10,7 +10,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, Message, MessageOriginChannel, ReactionTypeEmoji
 
 from diary.db import Db
-from diary.ingest import ingest_post
+from diary.ingest import ingest_post, untouched_plan
 
 from .. import pending, ui
 from ..channel import reaction_for, report
@@ -104,8 +104,8 @@ def register(router: Router, ctx: Ctx) -> None:
         if not text:
             await message.answer("В этом посте нет текста.")
             return
-        if db.is_sent(origin.message_id):
-            await message.answer("Это пост самого бота, учитывать его не нужно.")
+        if untouched_plan(db, origin.message_id, text):
+            await message.answer("Это программа бота без правок — записывать пока нечего.")
             return
         res = ingest_post(db, origin.message_id, origin.date, text)
         if emoji := reaction_for(res):
